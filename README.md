@@ -1,5 +1,29 @@
 <h1 align="center">Evo-RL</h1>
 
+## `train` 分支新增内容
+
+本分支在 Evo-RL 基础上补充了胡萝卜插孔任务的 Pi0.5 ACP 训练、PiStar0.6 value 训练/推理、训练集开环评估和模型发布工具。
+
+新增文件：
+
+- [`examples/open_loop_trainset_eval.py`](examples/open_loop_trainset_eval.py)：在训练集样本上进行 Pi0.5 action chunk 开环推理，对比训练标签、`Advantage: positive`、无条件和 CFG 输出，并生成 JSON、CSV、图像及 HTML 报告。
+- [`src/lerobot/processor/relative_action_processor.py`](src/lerobot/processor/relative_action_processor.py)：注册 `relative_actions_processor` 和 `absolute_actions_processor`，兼容 Pi0.5 checkpoint 的 processor 配置；当前训练模型中两者均为 `enabled=false`，实际仍使用绝对关节位置。
+- [`launch_value_train_run4.sh`](launch_value_train_run4.sh)：PiStar0.6 value model 训练入口。
+- [`launch_value_infer_run4_n50_r30.sh`](launch_value_infer_run4_n50_r30.sh)：value inference 与 ACP indicator 标注入口。
+- [`launch_pi05_acp_smoke_bs64.sh`](launch_pi05_acp_smoke_bs64.sh)：Pi0.5 ACP 小规模训练检查。
+- [`launch_pi05_acp_bs256_e10.sh`](launch_pi05_acp_bs256_e10.sh)：4 GPU、全局 batch size 256、10 epoch 的 Pi0.5 ACP 正式训练入口。
+- [`upload_pi05_acp_selected_epochs.py`](upload_pi05_acp_selected_epochs.py)：向 Hugging Face 上传 epoch 3、5、7、10 checkpoint。
+- [`hf_model_cards/pistart0.6-insert-carrot_README.md`](hf_model_cards/pistart0.6-insert-carrot_README.md)：PiStar0.6 value model 模型卡。
+- [`hf_model_cards/pistar06_insert_carrot_into_the_hole_acp_r1_README.md`](hf_model_cards/pistar06_insert_carrot_into_the_hole_acp_r1_README.md)：Pi0.5 ACP policy 模型卡。
+
+同时修改了以下现有文件：
+
+- [`src/lerobot/configs/train.py`](src/lerobot/configs/train.py) 和 [`src/lerobot/utils/train_utils.py`](src/lerobot/utils/train_utils.py)：增加可选的 `save_training_state`，支持仅保存推理所需 checkpoint。
+- [`src/lerobot/scripts/lerobot_value_train.py`](src/lerobot/scripts/lerobot_value_train.py)：允许 DDP 跳过 PiStar0.6 中未参与训练的 SigLIP text branch 参数。
+- [`src/lerobot/processor/__init__.py`](src/lerobot/processor/__init__.py)：导出并触发 relative/absolute action processor 注册。
+
+> 远程异步推理仍使用 Evo-RL/LeRobot 原有的 `lerobot.async_inference.policy_server` 和 `robot_client`；本分支没有新增或修改 `src/lerobot/async_inference/`。
+
 <p align="center">
   <a href="https://MINT-SJTU.github.io/Evo-RL/"><img alt="project website" src="https://img.shields.io/badge/Project-Website-0ea5e9"/></a>
   <a href="https://github.com/huggingface/lerobot"><img alt="lerobot version" src="https://img.shields.io/badge/LeRobot-0.4.4-f59e0b"/></a>
