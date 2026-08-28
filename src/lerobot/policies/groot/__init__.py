@@ -15,7 +15,5 @@
 # limitations under the License.
 
 from .configuration_groot import GrootConfig
-from .modeling_groot import GrootPolicy
-from .processor_groot import make_groot_pre_post_processors
 
-__all__ = ["GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]
+__all__ = ["GrootConfig"]

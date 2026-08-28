@@ -452,6 +452,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # 每集开始前清理上一轮保存/编码期间残留的按键事件，避免新 episode 被立刻空退出。
+                events["exit_early"] = False
+                events["toggle_intervention"] = False
                 events["episode_outcome"] = None
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
@@ -539,6 +542,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 extra_episode_metadata = (
                     {"episode_success": episode_success} if cfg.enable_episode_outcome_labeling else None
                 )
+                episode_buffer_size = 0 if dataset.episode_buffer is None else dataset.episode_buffer["size"]
+                if episode_buffer_size == 0:
+                    # 空 episode 通常来自按键残留或启动瞬间退出，不保存，避免污染数据集。
+                    logging.warning(
+                        "Episode %s has no frames; skipping save_episode().",
+                        dataset.num_episodes,
+                    )
+                    dataset.clear_episode_buffer(delete_images=len(dataset.meta.image_keys) > 0)
+                    continue
                 dataset.save_episode(extra_episode_metadata=extra_episode_metadata)
                 recorded_episodes += 1
     finally:
