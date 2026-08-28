@@ -59,6 +59,28 @@ from lerobot.utils.constants import (
 )
 
 
+def _reconnect_relative_absolute_steps(
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> None:
+    """反序列化 processor 后，恢复相对/绝对 action 处理器的运行时引用。"""
+    from lerobot.processor.relative_action_processor import (
+        AbsoluteActionsProcessorStep,
+        RelativeActionsProcessorStep,
+    )
+
+    relative_step = next(
+        (step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)),
+        None,
+    )
+    if relative_step is None:
+        return
+
+    for step in postprocessor.steps:
+        if isinstance(step, AbsoluteActionsProcessorStep):
+            step.relative_step = relative_step
+
+
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     """
     Retrieves a policy class by its registered name.
@@ -270,26 +292,28 @@ def make_pre_post_processors(
             kwargs["preprocessor_overrides"] = preprocessor_overrides
             kwargs["postprocessor_overrides"] = postprocessor_overrides
 
-        return (
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("preprocessor_overrides", {}),
-                to_transition=batch_to_transition,
-                to_output=transition_to_batch,
+        preprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
             ),
-            PolicyProcessorPipeline.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,
-                config_filename=kwargs.get(
-                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
-                ),
-                overrides=kwargs.get("postprocessor_overrides", {}),
-                to_transition=policy_action_to_transition,
-                to_output=transition_to_policy_action,
-            ),
+            overrides=kwargs.get("preprocessor_overrides", {}),
+            to_transition=batch_to_transition,
+            to_output=transition_to_batch,
         )
+        postprocessor = PolicyProcessorPipeline.from_pretrained(
+            pretrained_model_name_or_path=pretrained_path,
+            config_filename=kwargs.get(
+                "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+            ),
+            overrides=kwargs.get("postprocessor_overrides", {}),
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
+        )
+
+        # relative/absolute 是一对处理器，加载模型配置后需要恢复运行时引用。
+        _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        return preprocessor, postprocessor
 
     # Create a new processor based on policy type
     if isinstance(policy_cfg, TDMPCConfig):
