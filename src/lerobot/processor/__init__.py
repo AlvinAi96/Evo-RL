@@ -74,9 +74,16 @@ from .policy_robot_bridge import (
     RobotActionToPolicyActionProcessorStep,
 )
 from .rename_processor import RenameObservationsProcessorStep
+from .relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+    to_absolute_actions,
+    to_relative_actions,
+)
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
+    "AbsoluteActionsProcessorStep",
     "ActionProcessorStep",
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
@@ -112,6 +119,7 @@ __all__ = [
     "RobotActionProcessorStep",
     "RobotObservation",
     "RenameObservationsProcessorStep",
+    "RelativeActionsProcessorStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
     "DataProcessorPipeline",
@@ -126,6 +134,8 @@ __all__ = [
     "transition_to_batch",
     "TransitionKey",
     "TruncatedProcessorStep",
+    "to_absolute_actions",
+    "to_relative_actions",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]
