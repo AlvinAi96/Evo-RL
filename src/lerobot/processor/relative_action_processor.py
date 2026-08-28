@@ -98,7 +98,10 @@ class RelativeActionsProcessorStep(ProcessorStep):
         mask = []
         for name in self.action_names[:action_dim]:
             action_name = str(name).lower()
-            is_excluded = any(token == action_name or token in action_name for token in exclude_tokens)
+            is_excluded = any(
+                token == action_name or token in action_name
+                for token in exclude_tokens
+            )
             mask.append(not is_excluded)
 
         if len(mask) < action_dim:
@@ -162,7 +165,9 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return transition
 
         if self.relative_step is None:
-            raise RuntimeError("AbsoluteActionsProcessorStep requires a paired RelativeActionsProcessorStep.")
+            raise RuntimeError(
+                "AbsoluteActionsProcessorStep requires a paired RelativeActionsProcessorStep."
+            )
 
         cached_state = self.relative_step.get_cached_state()
         if cached_state is None:
@@ -174,7 +179,11 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
+        new_transition[TransitionKey.ACTION] = to_absolute_actions(
+            action,
+            cached_state,
+            mask,
+        )
         return new_transition
 
     def get_config(self) -> dict[str, Any]:
