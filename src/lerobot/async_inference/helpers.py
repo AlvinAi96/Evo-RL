@@ -311,6 +311,7 @@ class RemotePolicyConfig:
     acp_enable: bool = False
     acp_use_cfg: bool = False
     acp_cfg_beta: float = 1.0
+    select_action_batch_size: int = 1
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

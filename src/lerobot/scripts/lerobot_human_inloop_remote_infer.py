@@ -22,6 +22,7 @@
 import logging
 import pickle  # nosec
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pprint import pformat
@@ -117,6 +118,7 @@ class HumanInloopRemoteInferConfig:
     policy_sync_parallel: bool = True
     intervention_state_machine_enabled: bool = True
     intervention_toggle_key: str = "i"
+    remote_action_buffer_size: int = 5
     acp_inference: ACPInferenceConfig = field(default_factory=ACPInferenceConfig)
     communication_retry_timeout_s: float = 2.0
     communication_retry_interval_s: float = 0.1
@@ -132,6 +134,8 @@ class HumanInloopRemoteInferConfig:
             raise ValueError("`actions_per_chunk` must be positive.")
         if self.fps <= 0:
             raise ValueError("`fps` must be positive.")
+        if self.remote_action_buffer_size <= 0:
+            raise ValueError("`remote_action_buffer_size` must be positive.")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
         if self.communication_retry_timeout_s < 0:
@@ -164,6 +168,7 @@ class RemotePolicyActionClient:
             acp_enable=cfg.acp_inference.enable,
             acp_use_cfg=cfg.acp_inference.use_cfg,
             acp_cfg_beta=cfg.acp_inference.cfg_beta,
+            select_action_batch_size=cfg.remote_action_buffer_size,
         )
         self.channel = grpc.insecure_channel(
             cfg.server_address, grpc_channel_options(initial_backoff=f"{cfg.environment_dt:.4f}s")
@@ -172,6 +177,7 @@ class RemotePolicyActionClient:
         self._running = False
         self.latest_action = -1
         self.reset_policy_on_next_observation = False
+        self.action_buffer: deque[RobotAction] = deque()
 
     @property
     def running(self) -> bool:
@@ -199,7 +205,13 @@ class RemotePolicyActionClient:
 
     def request_policy_reset(self) -> None:
         """标记下一次远端推理前重置 policy/preprocessor/postprocessor 缓存。"""
+        # 释放人工接管后，旧 buffer 不能继续执行，必须让远端基于新状态重算。
+        self.action_buffer.clear()
         self.reset_policy_on_next_observation = True
+
+    def clear_action_buffer(self) -> None:
+        """清空本地尚未执行的小 action buffer。"""
+        self.action_buffer.clear()
 
     def send_observation(self, observation: RawObservation, task: str) -> bool:
         """把当前 observation 和 task 打包成 TimedObservation 发给远端。"""
@@ -232,23 +244,32 @@ class RemotePolicyActionClient:
             logging.error("Error sending observation #%s: %s", timed_observation.get_timestep(), error)
             return False
 
-    def get_policy_action(self) -> RobotAction | None:
-        """同步等待远端返回当前 observation 对应的单步 policy action。"""
+    def get_policy_actions(self) -> list[RobotAction]:
+        """同步等待远端返回当前 observation 对应的一小段 select_action 结果。"""
         try:
             actions = self.stub.GetActions(services_pb2.Empty())
             if len(actions.data) == 0:
-                return None
-            action = pickle.loads(actions.data)  # nosec
-            return action
+                return []
+            payload = pickle.loads(actions.data)  # nosec
+            if isinstance(payload, list):
+                return payload
+            return [payload]
         except grpc.RpcError as error:
             logging.error("Error receiving remote policy action: %s", error)
-            return None
+            return []
 
     def predict_action(self, observation: RawObservation, task: str) -> RobotAction | None:
-        """发送 observation 并取回单步 action，行为对齐原版 human-inloop 的阻塞推理。"""
+        """返回一个单步 action；buffer 空时才向远端请求新的 select_action 小段。"""
+        if self.action_buffer:
+            return self.action_buffer.popleft()
+
         if not self.send_observation(observation, task):
             return None
-        return self.get_policy_action()
+        # 一次取回多个 select_action 单步结果，用很小 buffer 摊薄传图/RPC 时间。
+        self.action_buffer.extend(self.get_policy_actions())
+        if not self.action_buffer:
+            return None
+        return self.action_buffer.popleft()
 
 
 def _run_with_connection_retry(
@@ -334,6 +355,7 @@ def _remote_human_inloop_loop(
             if intervention_enabled:
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     _set_teleop_manual_control(teleop, True)
+                    remote_client.clear_action_buffer()
                     intervention_state = INTERVENTION_STATE_ACTIVE
                     logging.info("Intervention enabled: teleop actions override remote policy.")
                 else:
