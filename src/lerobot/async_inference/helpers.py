@@ -256,6 +256,20 @@ class TimedAction(TimedData):
 
 
 @dataclass
+class BufferedActions:
+    """一批需要按顺序执行的动作，来源于同一次 observation 补货。"""
+
+    observation_timestep: int
+    actions: list[TimedAction]
+
+    def get_observation_timestep(self) -> int:
+        return self.observation_timestep
+
+    def get_actions(self) -> list[TimedAction]:
+        return self.actions
+
+
+@dataclass
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False

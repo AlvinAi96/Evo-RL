@@ -22,6 +22,7 @@
 import logging
 import pickle  # nosec
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pprint import pformat
@@ -31,8 +32,10 @@ import grpc
 import rerun as rr
 
 from lerobot.async_inference.helpers import (
+    BufferedActions,
     RawObservation,
     RemotePolicyConfig,
+    TimedAction,
     TimedObservation,
     map_robot_keys_to_lerobot_features,
 )
@@ -146,7 +149,7 @@ class HumanInloopRemoteInferConfig:
 
 
 class RemotePolicyActionClient:
-    """本地机器人侧 gRPC 客户端，按 HIL 语义同步请求单步 policy action。"""
+    """本地机器人侧 gRPC 客户端，按原版 select_action 语义整段补货并本地逐步消费。"""
 
     def __init__(self, cfg: HumanInloopRemoteInferConfig, robot: Robot):
         """基于本地 robot schema 构造远端 policy 所需的特征描述。"""
@@ -160,7 +163,7 @@ class RemotePolicyActionClient:
             device=cfg.policy_device,
             action_names=self.action_names,
             robot_type=robot.robot_type,
-            inference_mode="select_action",
+            inference_mode="select_action_buffered",
             acp_enable=cfg.acp_inference.enable,
             acp_use_cfg=cfg.acp_inference.use_cfg,
             acp_cfg_beta=cfg.acp_inference.cfg_beta,
@@ -172,6 +175,7 @@ class RemotePolicyActionClient:
         self._running = False
         self.latest_action = -1
         self.reset_policy_on_next_observation = False
+        self._buffered_actions: deque[TimedAction] = deque()
 
     @property
     def running(self) -> bool:
@@ -198,8 +202,9 @@ class RemotePolicyActionClient:
         self.channel.close()
 
     def request_policy_reset(self) -> None:
-        """标记下一次远端推理前重置 policy/preprocessor/postprocessor 缓存。"""
+        """标记下一次远端推理前重置 policy/preprocessor/postprocessor 缓存，并清空本地动作缓存。"""
         self.reset_policy_on_next_observation = True
+        self._buffered_actions.clear()
 
     def send_observation(self, observation: RawObservation, task: str) -> bool:
         """把当前 observation 和 task 打包成 TimedObservation 发给远端。"""
@@ -225,30 +230,84 @@ class RemotePolicyActionClient:
                 silent=True,
             )
             self.stub.SendObservations(observation_iterator)
-            self.latest_action = timed_observation.get_timestep()
             self.reset_policy_on_next_observation = False
             return True
         except grpc.RpcError as error:
             logging.error("Error sending observation #%s: %s", timed_observation.get_timestep(), error)
             return False
 
-    def get_policy_action(self) -> RobotAction | None:
-        """同步等待远端返回当前 observation 对应的单步 policy action。"""
+    def get_policy_actions(self) -> BufferedActions | None:
+        """同步等待远端返回当前 observation 对应的一段 buffered actions。"""
         try:
             actions = self.stub.GetActions(services_pb2.Empty())
             if len(actions.data) == 0:
                 return None
-            action = pickle.loads(actions.data)  # nosec
-            return action
+            action_payload = pickle.loads(actions.data)  # nosec
+            if isinstance(action_payload, BufferedActions):
+                return action_payload
+            if isinstance(action_payload, list):
+                # 兼容旧服务端直接返回 list[TimedAction] / list[dict] 的场景。
+                buffered_actions = []
+                for offset, action in enumerate(action_payload):
+                    if isinstance(action, TimedAction):
+                        buffered_actions.append(action)
+                    else:
+                        buffered_actions.append(
+                            TimedAction(
+                                timestamp=time.time() + offset * self.cfg.environment_dt,
+                                timestep=max(self.latest_action + 1, 0) + offset,
+                                action=action,
+                            )
+                        )
+                return BufferedActions(
+                    observation_timestep=max(self.latest_action + 1, 0),
+                    actions=buffered_actions,
+                )
+            if isinstance(action_payload, dict):
+                return BufferedActions(
+                    observation_timestep=max(self.latest_action + 1, 0),
+                    actions=[
+                        TimedAction(
+                            timestamp=time.time(),
+                            timestep=max(self.latest_action + 1, 0),
+                            action=action_payload,
+                        )
+                    ],
+                )
+            raise TypeError(f"Unsupported remote action payload type: {type(action_payload)}")
         except grpc.RpcError as error:
-            logging.error("Error receiving remote policy action: %s", error)
+            logging.error("Error receiving remote policy actions: %s", error)
+            return None
+        except Exception as error:
+            logging.error("Error decoding remote policy actions: %s", error)
             return None
 
-    def predict_action(self, observation: RawObservation, task: str) -> RobotAction | None:
-        """发送 observation 并取回单步 action，行为对齐原版 human-inloop 的阻塞推理。"""
+    def _refill_action_buffer(self, observation: RawObservation, task: str) -> bool:
+        """当本地 buffer 为空时，用当前 observation 向远端整段补货。"""
         if not self.send_observation(observation, task):
+            return False
+        buffered_actions = self.get_policy_actions()
+        if buffered_actions is None:
+            return False
+        self._buffered_actions = deque(buffered_actions.get_actions())
+        logging.info(
+            "Received buffered remote actions for observation #%s | buffered_actions=%d",
+            buffered_actions.get_observation_timestep(),
+            len(self._buffered_actions),
+        )
+        return len(self._buffered_actions) > 0
+
+    def predict_action(self, observation: RawObservation, task: str) -> RobotAction | None:
+        """按原版 select_action 队列边界整段补货，再从本地 buffer 逐步取一个动作执行。"""
+        if len(self._buffered_actions) == 0 and not self._refill_action_buffer(observation, task):
             return None
-        return self.get_policy_action()
+
+        timed_action = self._buffered_actions.popleft()
+        self.latest_action = timed_action.get_timestep()
+        action = timed_action.get_action()
+        if not isinstance(action, dict):
+            raise TypeError(f"Expected robot action dict, got {type(action)}")
+        return action
 
 
 def _run_with_connection_retry(
