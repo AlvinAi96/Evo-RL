@@ -13,9 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+
 import numpy as np
 
 from lerobot.datasets.utils import load_image_as_numpy
+from lerobot.utils.constants import ACTION, OBS_STATE
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -624,3 +627,129 @@ def aggregate_stats(stats_list: list[dict[str, dict]]) -> dict[str, dict[str, np
         aggregated_stats[key] = aggregate_feature_stats(stats_with_key)
 
     return aggregated_stats
+
+
+def _get_valid_chunk_starts(episode_indices: np.ndarray, chunk_size: int) -> np.ndarray:
+    """Return starts for chunks that remain inside a single episode."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    total_frames = len(episode_indices)
+    if total_frames < chunk_size:
+        return np.array([], dtype=np.int64)
+
+    starts = np.arange(total_frames - chunk_size + 1, dtype=np.int64)
+    valid = episode_indices[starts] == episode_indices[starts + chunk_size - 1]
+    return starts[valid]
+
+
+def _compute_relative_chunk_batch(
+    start_indices: np.ndarray,
+    all_actions: np.ndarray,
+    all_states: np.ndarray,
+    chunk_size: int,
+    relative_mask: np.ndarray,
+) -> np.ndarray:
+    """Compute flattened relative-action chunks for a batch of start indices."""
+    if len(start_indices) == 0:
+        return np.empty((0, all_actions.shape[1]), dtype=np.float32)
+
+    offsets = np.arange(chunk_size, dtype=np.int64)
+    frame_indices = start_indices[:, None] + offsets[None, :]
+    chunks = all_actions[frame_indices].copy()
+    reference_states = all_states[start_indices]
+    mask_dim = len(relative_mask)
+    chunks[:, :, :mask_dim] -= reference_states[:, None, :mask_dim] * relative_mask[None, None, :]
+    return chunks.reshape(-1, all_actions.shape[1])
+
+
+def compute_relative_action_stats(
+    hf_dataset,
+    features: dict,
+    chunk_size: int,
+    exclude_joints: list[str] | None = None,
+    num_workers: int = 0,
+) -> dict[str, np.ndarray]:
+    """Compute action normalization stats in relative-trajectory space.
+
+    Every action in a chunk is expressed relative to the state at the start of
+    that chunk. Dimensions selected by ``exclude_joints`` retain their original
+    absolute values. This matches the targets produced by
+    ``RelativeActionsProcessorStep`` during policy training.
+    """
+    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+    if ACTION not in features or OBS_STATE not in features:
+        raise ValueError(f"Relative action stats require both '{ACTION}' and '{OBS_STATE}' features")
+
+    action_dim = features[ACTION]["shape"][0]
+    action_names = features[ACTION].get("names")
+    mask_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=exclude_joints or [],
+        action_names=action_names,
+    )
+    relative_mask = np.asarray(mask_step._build_mask(action_dim), dtype=np.float32)
+
+    logging.info("Loading action/state data for relative action stats")
+    all_actions = np.asarray(hf_dataset[ACTION], dtype=np.float32)
+    all_states = np.asarray(hf_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.asarray(hf_dataset["episode_index"])
+
+    if all_actions.ndim != 2 or all_actions.shape[1] != action_dim:
+        raise ValueError(f"Expected action data with shape (frames, {action_dim}), got {all_actions.shape}")
+    if all_states.ndim != 2 or all_states.shape[1] < action_dim:
+        raise ValueError(
+            f"State dimension must be at least action dimension {action_dim}, got {all_states.shape}"
+        )
+
+    valid_starts = _get_valid_chunk_starts(episode_indices, chunk_size)
+    if len(valid_starts) == 0:
+        raise RuntimeError(
+            f"No valid chunks found (total_frames={len(episode_indices)}, chunk_size={chunk_size})"
+        )
+
+    effective_workers = max(num_workers, 1)
+    logging.info(
+        "Computing relative action stats from %d chunks (chunk_size=%d, workers=%d)",
+        len(valid_starts),
+        chunk_size,
+        effective_workers,
+    )
+
+    batch_size = 50_000
+    batches = [valid_starts[i : i + batch_size] for i in range(0, len(valid_starts), batch_size)]
+    running_stats = RunningQuantileStats()
+
+    if num_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+            futures = [
+                pool.submit(
+                    _compute_relative_chunk_batch,
+                    batch,
+                    all_actions,
+                    all_states,
+                    chunk_size,
+                    relative_mask,
+                )
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                running_stats.update(future.result())
+    else:
+        for batch in batches:
+            running_stats.update(
+                _compute_relative_chunk_batch(batch, all_actions, all_states, chunk_size, relative_mask)
+            )
+
+    stats = running_stats.get_statistics()
+    logging.info(
+        "Relative action stats: chunks=%d frames=%d relative_dims=%d/%d excluded=%d",
+        len(valid_starts),
+        len(valid_starts) * chunk_size,
+        int(relative_mask.sum()),
+        len(relative_mask),
+        int(len(relative_mask) - relative_mask.sum()),
+    )
+    return stats

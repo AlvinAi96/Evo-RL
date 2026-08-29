@@ -1,15 +1,21 @@
 <h1 align="center">Evo-RL</h1>
 
-## `train` 分支新增内容
+## `train_relative` 分支新增内容
 
-本分支在 Evo-RL 基础上补充了胡萝卜插孔任务的 Pi0.5 ACP 训练、PiStar0.6 value 训练/推理、训练集开环评估和模型发布工具。
+本分支基于 `train`，在保留胡萝卜插孔任务 Pi0.5 ACP、PiStar0.6 value
+训练/推理和开环评估能力的同时，完整接入 LeRobot 的 relative trajectory
+action 流程：关节维度可以相对当前观测状态预测，夹爪维度保持绝对值。
 
 新增文件：
 
 - [`examples/open_loop_trainset_eval.py`](examples/open_loop_trainset_eval.py)：在训练集样本上进行 Pi0.5 action chunk 开环推理，对比训练标签、`Advantage: positive`、无条件和 CFG 输出，并生成 JSON、CSV、图像及 HTML 报告。
-- [`src/lerobot/processor/relative_action_processor.py`](src/lerobot/processor/relative_action_processor.py)：注册 `relative_actions_processor` 和 `absolute_actions_processor`，兼容 Pi0.5 checkpoint 的 processor 配置；当前训练模型中两者均为 `enabled=false`，实际仍使用绝对关节位置。
+- [`src/lerobot/processor/relative_action_processor.py`](src/lerobot/processor/relative_action_processor.py)：注册 `relative_actions_processor` 和 `absolute_actions_processor`，训练时把选定 action 维度转换为相对当前状态的 offset，推理时对同一维度加回当前状态。
+- [`src/lerobot/datasets/compute_stats.py`](src/lerobot/datasets/compute_stats.py) 和 [`src/lerobot/scripts/lerobot_edit_dataset.py`](src/lerobot/scripts/lerobot_edit_dataset.py)：增加 episode-aware、chunk-level relative action 统计以及 `recompute_stats` CLI。
+- [`src/lerobot/policies/pi05/configuration_pi05.py`](src/lerobot/policies/pi05/configuration_pi05.py) 和 [`src/lerobot/policies/pi05/processor_pi05.py`](src/lerobot/policies/pi05/processor_pi05.py)：支持 `use_relative_actions`、`relative_exclude_joints` 和 action feature names，并按 `relative → normalize → model → unnormalize → absolute` 的顺序处理动作。
 - [`launch_value_train_run4.sh`](launch_value_train_run4.sh)：PiStar0.6 value model 训练入口。
 - [`launch_value_infer_run4_n50_r30.sh`](launch_value_infer_run4_n50_r30.sh)：value inference 与 ACP indicator 标注入口。
+- [`launch_value_train_success_only_4gpu.sh`](launch_value_train_success_only_4gpu.sh)：纯成功数据集的 4 GPU PiStar0.6 value 训练入口。
+- [`launch_value_infer_success_only_n50_r30.sh`](launch_value_infer_success_only_n50_r30.sh)：纯成功 value checkpoint 的 inference 与 ACP 标注入口。
 - [`launch_pi05_acp_smoke_bs64.sh`](launch_pi05_acp_smoke_bs64.sh)：Pi0.5 ACP 小规模训练检查。
 - [`launch_pi05_acp_bs256_e10.sh`](launch_pi05_acp_bs256_e10.sh)：4 GPU、全局 batch size 256、10 epoch 的 Pi0.5 ACP 正式训练入口。
 - [`upload_pi05_acp_selected_epochs.py`](upload_pi05_acp_selected_epochs.py)：向 Hugging Face 上传 epoch 3、5、7、10 checkpoint。
@@ -19,8 +25,42 @@
 同时修改了以下现有文件：
 
 - [`src/lerobot/configs/train.py`](src/lerobot/configs/train.py) 和 [`src/lerobot/utils/train_utils.py`](src/lerobot/utils/train_utils.py)：增加可选的 `save_training_state`，支持仅保存推理所需 checkpoint。
-- [`src/lerobot/scripts/lerobot_value_train.py`](src/lerobot/scripts/lerobot_value_train.py)：允许 DDP 跳过 PiStar0.6 中未参与训练的 SigLIP text branch 参数。
+- [`src/lerobot/configs/value_train.py`](src/lerobot/configs/value_train.py) 和 [`src/lerobot/scripts/lerobot_value_train.py`](src/lerobot/scripts/lerobot_value_train.py)：补齐通用 checkpoint 接口所需的 `save_training_state`，允许 DDP 跳过未参与训练的 SigLIP text branch 参数，并修正多卡 metrics 的 batch-size 统计参数。
+- [`src/lerobot/policies/factory.py`](src/lerobot/policies/factory.py) 和 [`src/lerobot/scripts/lerobot_train.py`](src/lerobot/scripts/lerobot_train.py)：从数据集 metadata 自动读取 action names；加载 pretrained processor 后恢复 relative/absolute processor 的共享状态引用，并对 pretrained Pi0.5 processor 应用相对动作配置。
 - [`src/lerobot/processor/__init__.py`](src/lerobot/processor/__init__.py)：导出并触发 relative/absolute action processor 注册。
+
+### Pi0.5：关节相对、夹爪绝对
+
+这里的 relative action 是相对轨迹表示：一个 action chunk 中的每个关节目标都相对
+该次推理开始时的当前 `observation.state`，而不是相对上一条 action。训练前必须使用与
+policy `chunk_size` 一致的 chunk-level 统计：
+
+```bash
+lerobot-edit-dataset \
+  --repo_id=your_dataset \
+  --root=/path/to/your_dataset \
+  --operation.type=recompute_stats \
+  --operation.relative_action=true \
+  --operation.chunk_size=50 \
+  --operation.relative_exclude_joints='["gripper"]' \
+  --operation.overwrite=true
+```
+
+随后训练时启用对应 processor：
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your_dataset \
+  --dataset.root=/path/to/your_dataset \
+  --policy.path=lerobot/pi05_base \
+  --policy.use_relative_actions=true \
+  --policy.relative_exclude_joints='["gripper"]' \
+  ...
+```
+
+action names 会从数据集 metadata 自动读取；名称中匹配 `gripper` 的维度不做减法或
+加法，因此训练和推理都保持夹爪绝对控制。默认
+`use_relative_actions=false`，原有绝对动作训练行为不变。
 
 > 远程异步推理仍使用 Evo-RL/LeRobot 原有的 `lerobot.async_inference.policy_server` 和 `robot_client`；本分支没有新增或修改 `src/lerobot/async_inference/`。
 

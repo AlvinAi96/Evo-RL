@@ -123,6 +123,7 @@ from lerobot.datasets.dataset_tools import (
     delete_episodes,
     merge_datasets,
     modify_tasks,
+    recompute_stats,
     remove_feature,
     split_dataset,
 )
@@ -182,6 +183,17 @@ class ConvertImageToVideoConfig(OperationConfig):
     num_workers: int = 4
     max_episodes_per_batch: int | None = None
     max_frames_per_batch: int | None = None
+
+
+@OperationConfig.register_subclass("recompute_stats")
+@dataclass
+class RecomputeStatsConfig(OperationConfig):
+    skip_image_video: bool = True
+    relative_action: bool = False
+    relative_exclude_joints: list[str] | None = None
+    chunk_size: int = 50
+    num_workers: int = 0
+    overwrite: bool = False
 
 
 @dataclass
@@ -436,6 +448,33 @@ def handle_convert_image_to_video(cfg: EditDatasetConfig) -> None:
         logging.info("Dataset saved locally (not pushed to hub)")
 
 
+def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, RecomputeStatsConfig):
+        raise ValueError("Operation config must be RecomputeStatsConfig")
+    if not cfg.operation.overwrite:
+        raise ValueError(
+            "recompute_stats updates meta/stats.json in place. "
+            "Pass --operation.overwrite=true after confirming the target dataset."
+        )
+    if cfg.new_repo_id is not None:
+        raise ValueError("recompute_stats currently operates in place; --new_repo_id is not supported")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    logging.warning("Recomputing stats in place at %s", dataset.root)
+    recompute_stats(
+        dataset,
+        skip_image_video=cfg.operation.skip_image_video,
+        relative_action=cfg.operation.relative_action,
+        relative_exclude_joints=cfg.operation.relative_exclude_joints,
+        chunk_size=cfg.operation.chunk_size,
+        num_workers=cfg.operation.num_workers,
+    )
+
+    if cfg.push_to_hub:
+        logging.info("Pushing updated stats to hub as %s", cfg.repo_id)
+        dataset.push_to_hub()
+
+
 @parser.wrap()
 def edit_dataset(cfg: EditDatasetConfig) -> None:
     operation_type = cfg.operation.type
@@ -452,6 +491,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":
         handle_convert_image_to_video(cfg)
+    elif operation_type == "recompute_stats":
+        handle_recompute_stats(cfg)
     else:
         available = ", ".join(OperationConfig.get_known_choices())
         raise ValueError(f"Unknown operation: {operation_type}\nAvailable operations: {available}")

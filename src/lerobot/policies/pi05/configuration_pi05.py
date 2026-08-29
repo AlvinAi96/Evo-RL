@@ -50,6 +50,15 @@ class PI05Config(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
+    # Relative trajectory actions: selected action dimensions are represented as
+    # offsets from the current observation state. Dimensions matching
+    # ``relative_exclude_joints`` remain absolute (typically the gripper).
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated from dataset metadata by ``make_policy`` so exclusions can be
+    # resolved by action-dimension name instead of by a hard-coded index.
+    action_feature_names: list[str] | None = None
+
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 

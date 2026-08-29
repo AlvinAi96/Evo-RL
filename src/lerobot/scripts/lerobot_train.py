@@ -291,24 +291,33 @@ def train(
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if cfg.policy.pretrained_path is not None:
-        processor_kwargs["preprocessor_overrides"] = {
+        preprocessor_overrides = {
             "device_processor": {"device": device.type},
             "normalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
             },
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
-        postprocessor_kwargs["postprocessor_overrides"] = {
+        postprocessor_overrides = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,
             },
         }
+
+        if getattr(policy.config, "use_relative_actions", False):
+            preprocessor_overrides["relative_actions_processor"] = {
+                "enabled": True,
+                "exclude_joints": getattr(policy.config, "relative_exclude_joints", []),
+                "action_names": getattr(policy.config, "action_feature_names", None),
+            }
+            postprocessor_overrides["absolute_actions_processor"] = {"enabled": True}
+
+        processor_kwargs["preprocessor_overrides"] = preprocessor_overrides
+        postprocessor_kwargs["postprocessor_overrides"] = postprocessor_overrides
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

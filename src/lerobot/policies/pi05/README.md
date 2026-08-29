@@ -3,6 +3,37 @@
 This repository contains the Hugging Face port of **π₀.₅**, adapted from [OpenPI](https://github.com/Physical-Intelligence/openpi) by the Physical Intelligence.
 It is designed as a **Vision-Language-Action model with open-world generalization**.
 
+## Relative trajectory actions
+
+π₀.₅ uses absolute actions by default. To train selected dimensions as offsets
+from the current observation state while keeping the gripper absolute, first
+recompute chunk-level action statistics:
+
+```bash
+lerobot-edit-dataset \
+  --repo_id=your_dataset \
+  --operation.type=recompute_stats \
+  --operation.relative_action=true \
+  --operation.chunk_size=50 \
+  --operation.relative_exclude_joints='["gripper"]' \
+  --operation.overwrite=true
+```
+
+Then enable the matching policy processors:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your_dataset \
+  --policy.type=pi05 \
+  --policy.use_relative_actions=true \
+  --policy.relative_exclude_joints='["gripper"]'
+```
+
+The training pipeline applies `relative → normalize`; inference applies
+`unnormalize → absolute`. Every action in a predicted chunk is relative to the
+single current state at the start of that inference call. Action names are read
+from dataset metadata, and names containing `gripper` remain absolute.
+
 ---
 
 ## Model Overview
