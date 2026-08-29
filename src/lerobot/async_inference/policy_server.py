@@ -38,17 +38,25 @@ import draccus
 import grpc
 import torch
 
+from lerobot.datasets.utils import build_dataset_frame
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
 )
 from lerobot.processor.rename_processor import RenameObservationsProcessorStep
+from lerobot.scripts.recording_hil import (
+    ACPInferenceConfig,
+    _capture_policy_runtime_state,
+    _predict_policy_action_with_acp_inference,
+)
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
+from lerobot.utils.constants import ACTION, OBS_STR
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -91,6 +99,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
         self.rename_map: dict[str, str] = {}
+        self.action_names: list[str] = []
+        self.robot_type: str | None = None
+        self.inference_mode: str = "action_chunk"
+        self.acp_inference = ACPInferenceConfig()
+        self.cond_policy_runtime_state: dict[str, Any] | None = None
+        self.uncond_policy_runtime_state: dict[str, Any] | None = None
 
     @property
     def running(self):
@@ -136,6 +150,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Policy type {policy_specs.policy_type} not supported. "
                 f"Supported policies: {SUPPORTED_POLICIES}"
             )
+        inference_mode = getattr(policy_specs, "inference_mode", "action_chunk")
+        action_names = list(getattr(policy_specs, "action_names", []))
+        if inference_mode not in {"action_chunk", "select_action"}:
+            raise ValueError(f"Unsupported inference_mode: {inference_mode}")
+        if inference_mode == "select_action" and not action_names:
+            raise ValueError("select_action mode requires action_names from the robot client.")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
@@ -149,6 +169,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.action_names = action_names
+        self.robot_type = getattr(policy_specs, "robot_type", None)
+        self.inference_mode = inference_mode
+        self.acp_inference = ACPInferenceConfig(
+            enable=getattr(policy_specs, "acp_enable", False),
+            use_cfg=getattr(policy_specs, "acp_use_cfg", False),
+            cfg_beta=getattr(policy_specs, "acp_cfg_beta", 1.0),
+        )
 
         policy_class = get_policy_class(self.policy_type)
 
@@ -173,12 +201,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         self.rename_map = self._extract_rename_map(self.preprocessor)
         self.logger.info("Loaded preprocessor rename_map: %s", self.rename_map)
+        self._reset_policy_runtime_state()
 
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
+
+    def _reset_policy_runtime_state(self) -> None:
+        """重置 policy 与 processor 的推理缓存，和 human-inloop 释放接管时保持一致。"""
+        # HIL 释放人工接管后，原版会重置 policy/preprocessor/postprocessor。
+        if self.policy is not None and hasattr(self.policy, "reset"):
+            self.policy.reset()
+        if self.preprocessor is not None:
+            self.preprocessor.reset()
+        if self.postprocessor is not None:
+            self.postprocessor.reset()
+
+        self.cond_policy_runtime_state = None
+        self.uncond_policy_runtime_state = None
+        if self.policy is not None and self.acp_inference.enable and self.acp_inference.use_cfg:
+            self.cond_policy_runtime_state = _capture_policy_runtime_state(self.policy)
+            self.uncond_policy_runtime_state = _capture_policy_runtime_state(self.policy)
 
     def _extract_rename_map(
         self, preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None
@@ -252,11 +297,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 self._predicted_timesteps.add(obs.get_timestep())
 
             start_time = time.perf_counter()
-            action_chunk = self._predict_action_chunk(obs)
+            if self.inference_mode == "select_action":
+                action_payload = self._predict_select_action(obs)
+            else:
+                action_payload = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
             start_time = time.perf_counter()
-            actions_bytes = pickle.dumps(action_chunk)  # nosec
+            actions_bytes = pickle.dumps(action_payload)  # nosec
             serialize_time = time.perf_counter() - start_time
 
             # Create and return the action chunk
@@ -310,6 +358,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Enqueue an observation if it must go through processing, otherwise skip it.
         Observations not in queue are never run through the policy network"""
 
+        if self.inference_mode == "select_action":
+            # HIL 对齐模式不做 async 的相似帧过滤；原版 human-inloop 每轮都会用当前观测推理。
+            if self.observation_queue.full():
+                _ = self.observation_queue.get_nowait()
+            self.observation_queue.put(obs)
+            return True
+
         if (
             obs.must_go
             or self.last_processed_obs is None
@@ -349,6 +404,51 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
         return chunk[:, : self.actions_per_chunk, :]
+
+    def _dataset_features_for_action(self) -> dict[str, dict]:
+        """构造 make_robot_action 需要的最小 action feature 描述。"""
+        # 原版 human-inloop 通过 dataset.features 映射 action 维度；远端纯推理没有 dataset，
+        # 因此这里用客户端传来的 robot.action_features 顺序构造等价的 action names。
+        return {
+            ACTION: {
+                "dtype": "float32",
+                "shape": [len(self.action_names)],
+                "names": self.action_names,
+            }
+        }
+
+    def _predict_select_action(self, observation_t: TimedObservation) -> dict[str, float]:
+        """按原版 human-inloop 的 predict_action/select_action 路径预测单步动作。"""
+        if observation_t.should_reset_policy():
+            self.logger.info("Resetting policy runtime state before observation #%s", observation_t.get_timestep())
+            self._reset_policy_runtime_state()
+
+        raw_observation = dict(observation_t.get_observation())
+        task = raw_observation.pop("task", "")
+
+        # 先构造和 dataset frame 同名的 observation，再交给原版 ACP/predict_action helper。
+        observation_frame = build_dataset_frame(self.lerobot_features, raw_observation, prefix=OBS_STR)
+        action_tensor = _predict_policy_action_with_acp_inference(
+            observation_frame=observation_frame,
+            policy=self.policy,
+            device=torch.device(self.device),
+            preprocessor=self.preprocessor,
+            postprocessor=self.postprocessor,
+            use_amp=self.policy.config.use_amp,
+            task=task,
+            robot_type=self.robot_type,
+            acp_inference=self.acp_inference,
+            cond_runtime_state=self.cond_policy_runtime_state,
+            uncond_runtime_state=self.uncond_policy_runtime_state,
+        )
+        action = make_robot_action(action_tensor, self._dataset_features_for_action())
+        self.last_processed_obs = observation_t
+        self.logger.info(
+            "Select action #%s generated | action_dim=%d",
+            observation_t.get_timestep(),
+            len(action),
+        )
+        return action
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.

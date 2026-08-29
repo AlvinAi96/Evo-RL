@@ -21,22 +21,18 @@
 
 import logging
 import pickle  # nosec
-import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pprint import pformat
-from queue import Queue
 from typing import Any, TypeVar
 
 import grpc
 import rerun as rr
 
-from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import (
     RawObservation,
     RemotePolicyConfig,
-    TimedAction,
     TimedObservation,
     map_robot_keys_to_lerobot_features,
 )
@@ -44,7 +40,6 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # no
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import RobotAction, make_default_processors
-from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -118,7 +113,7 @@ class HumanInloopRemoteInferConfig:
     display_port: int | None = None
     display_compressed_images: bool = False
     play_sounds: bool = True
-    policy_sync_to_teleop: bool = False
+    policy_sync_to_teleop: bool = True
     policy_sync_parallel: bool = True
     intervention_state_machine_enabled: bool = True
     intervention_toggle_key: str = "i"
@@ -129,6 +124,8 @@ class HumanInloopRemoteInferConfig:
 
     def __post_init__(self):
         """校验远端推理所需的最小配置，避免真机启动后才报错。"""
+        if self.teleop is None:
+            raise ValueError("`lerobot-human-inloop-remote-infer` requires `teleop` config.")
         if not self.pretrained_name_or_path:
             raise ValueError("`pretrained_name_or_path` cannot be empty.")
         if self.actions_per_chunk <= 0:
@@ -137,16 +134,10 @@ class HumanInloopRemoteInferConfig:
             raise ValueError("`fps` must be positive.")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
-        if self.acp_inference.use_cfg:
-            raise ValueError(
-                "`lerobot-human-inloop-remote-infer` currently supports ACP positive tagging only; "
-                "set `acp_inference.use_cfg=false`."
-            )
         if self.communication_retry_timeout_s < 0:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
-        self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @property
     def environment_dt(self) -> float:
@@ -155,7 +146,7 @@ class HumanInloopRemoteInferConfig:
 
 
 class RemotePolicyActionClient:
-    """本地机器人侧 gRPC 客户端，负责发 observation、收远端 action chunk。"""
+    """本地机器人侧 gRPC 客户端，按 HIL 语义同步请求单步 policy action。"""
 
     def __init__(self, cfg: HumanInloopRemoteInferConfig, robot: Robot):
         """基于本地 robot schema 构造远端 policy 所需的特征描述。"""
@@ -167,24 +158,25 @@ class RemotePolicyActionClient:
             lerobot_features=map_robot_keys_to_lerobot_features(robot),
             actions_per_chunk=cfg.actions_per_chunk,
             device=cfg.policy_device,
+            action_names=self.action_names,
+            robot_type=robot.robot_type,
+            inference_mode="select_action",
+            acp_enable=cfg.acp_inference.enable,
+            acp_use_cfg=cfg.acp_inference.use_cfg,
+            acp_cfg_beta=cfg.acp_inference.cfg_beta,
         )
         self.channel = grpc.insecure_channel(
             cfg.server_address, grpc_channel_options(initial_backoff=f"{cfg.environment_dt:.4f}s")
         )
         self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
-        self.shutdown_event = threading.Event()
-        self.action_queue = Queue()
-        self.action_queue_lock = threading.Lock()
-        self.latest_action_lock = threading.Lock()
+        self._running = False
         self.latest_action = -1
-        self.action_chunk_size = cfg.actions_per_chunk
-        self.must_go = threading.Event()
-        self.must_go.set()
+        self.reset_policy_on_next_observation = False
 
     @property
     def running(self) -> bool:
         """判断当前 gRPC 客户端是否仍在运行。"""
-        return not self.shutdown_event.is_set()
+        return self._running
 
     def start(self) -> bool:
         """连接远端 policy server，并发送模型路径、动作维度和机器人特征。"""
@@ -194,7 +186,7 @@ class RemotePolicyActionClient:
             logging.info("Sending remote policy instructions to %s", self.cfg.server_address)
             logging.info("Remote policy action names: %s", self.action_names)
             self.stub.SendPolicyInstructions(policy_setup)
-            self.shutdown_event.clear()
+            self._running = True
             return True
         except grpc.RpcError as error:
             logging.error("Failed to connect to remote policy server: %s", error)
@@ -202,75 +194,12 @@ class RemotePolicyActionClient:
 
     def stop(self) -> None:
         """停止本地客户端并关闭 gRPC channel。"""
-        self.shutdown_event.set()
+        self._running = False
         self.channel.close()
 
-    def _aggregate_action_queues(self, incoming_actions: list[TimedAction]) -> None:
-        """合并远端新 chunk 和本地未执行 chunk，保留未来时间步的动作。"""
-        # 保留 async_inference 的 chunk 聚合逻辑，避免新旧 action chunk 互相覆盖过急。
-        future_action_queue = Queue()
-        with self.action_queue_lock:
-            current_action_queue = {
-                action.get_timestep(): action.get_action() for action in self.action_queue.queue
-            }
-
-        for new_action in incoming_actions:
-            with self.latest_action_lock:
-                latest_action = self.latest_action
-            if new_action.get_timestep() <= latest_action:
-                continue
-            if new_action.get_timestep() not in current_action_queue:
-                future_action_queue.put(new_action)
-                continue
-            future_action_queue.put(
-                TimedAction(
-                    timestamp=new_action.get_timestamp(),
-                    timestep=new_action.get_timestep(),
-                    action=self.cfg.aggregate_fn(
-                        current_action_queue[new_action.get_timestep()], new_action.get_action()
-                    ),
-                )
-            )
-
-        with self.action_queue_lock:
-            self.action_queue = future_action_queue
-
-    def receive_actions(self) -> None:
-        """后台线程循环接收远端 action chunk。"""
-        while self.running:
-            try:
-                actions_chunk = self.stub.GetActions(services_pb2.Empty())
-                if len(actions_chunk.data) == 0:
-                    continue
-
-                timed_actions: list[TimedAction] = pickle.loads(actions_chunk.data)  # nosec
-                if self.cfg.client_device != "cpu":
-                    for timed_action in timed_actions:
-                        timed_action.action = timed_action.get_action().to(self.cfg.client_device)
-
-                self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
-                self._aggregate_action_queues(timed_actions)
-                self.must_go.set()
-            except grpc.RpcError as error:
-                if self.running:
-                    logging.error("Error receiving remote actions: %s", error)
-
-    def actions_available(self) -> bool:
-        """判断本地 action 队列里是否有可执行动作。"""
-        with self.action_queue_lock:
-            return not self.action_queue.empty()
-
-    def clear_actions(self) -> None:
-        """清空本地 action 队列，用于人工接管和释放接管的边界。"""
-        # 接管状态切换时丢弃旧 chunk，避免释放后执行过期的 policy 动作。
-        with self.action_queue_lock:
-            self.action_queue = Queue()
-        self.must_go.set()
-
-    def ready_to_send_observation(self) -> bool:
-        """根据剩余 action 比例判断是否需要向远端补发新 observation。"""
-        with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self.cfg.chunk_size_threshold
+    def request_policy_reset(self) -> None:
+        """标记下一次远端推理前重置 policy/preprocessor/postprocessor 缓存。"""
+        self.reset_policy_on_next_observation = True
 
     def send_observation(self, observation: RawObservation, task: str) -> bool:
         """把当前 observation 和 task 打包成 TimedObservation 发给远端。"""
@@ -279,19 +208,16 @@ class RemotePolicyActionClient:
 
         raw_observation = dict(observation)
         raw_observation["task"] = task
-        with self.latest_action_lock:
-            latest_action = self.latest_action
-        with self.action_queue_lock:
-            must_go = self.must_go.is_set() and self.action_queue.empty()
 
         timed_observation = TimedObservation(
             timestamp=time.time(),
-            timestep=max(latest_action, 0),
+            timestep=max(self.latest_action + 1, 0),
             observation=raw_observation,
-            must_go=must_go,
+            must_go=True,
+            reset_policy=self.reset_policy_on_next_observation,
         )
         try:
-            # 将当前 observation 分块发到远端 VLA 服务，远端负责预处理和模型推理。
+            # 将当前 observation 发到远端 VLA 服务，远端按原版 select_action 路径推理单步动作。
             observation_iterator = send_bytes_in_chunks(
                 pickle.dumps(timed_observation),
                 services_pb2.Observation,
@@ -299,27 +225,30 @@ class RemotePolicyActionClient:
                 silent=True,
             )
             self.stub.SendObservations(observation_iterator)
-            if must_go:
-                self.must_go.clear()
+            self.latest_action = timed_observation.get_timestep()
+            self.reset_policy_on_next_observation = False
             return True
         except grpc.RpcError as error:
             logging.error("Error sending observation #%s: %s", timed_observation.get_timestep(), error)
             return False
 
-    def pop_policy_action(self) -> RobotAction | None:
-        """从本地队列取出一个 policy action，并转成 robot.send_action 需要的 dict。"""
-        with self.action_queue_lock:
-            if self.action_queue.empty():
+    def get_policy_action(self) -> RobotAction | None:
+        """同步等待远端返回当前 observation 对应的单步 policy action。"""
+        try:
+            actions = self.stub.GetActions(services_pb2.Empty())
+            if len(actions.data) == 0:
                 return None
-            if self.cfg.debug_log_queue_size:
-                logging.info("Remote action queue size: %s", self.action_queue.qsize())
-            timed_action = self.action_queue.get_nowait()
+            action = pickle.loads(actions.data)  # nosec
+            return action
+        except grpc.RpcError as error:
+            logging.error("Error receiving remote policy action: %s", error)
+            return None
 
-        action_tensor = timed_action.get_action()
-        action = {key: action_tensor[idx].item() for idx, key in enumerate(self.action_names)}
-        with self.latest_action_lock:
-            self.latest_action = timed_action.get_timestep()
-        return action
+    def predict_action(self, observation: RawObservation, task: str) -> RobotAction | None:
+        """发送 observation 并取回单步 action，行为对齐原版 human-inloop 的阻塞推理。"""
+        if not self.send_observation(observation, task):
+            return None
+        return self.get_policy_action()
 
 
 def _run_with_connection_retry(
@@ -357,10 +286,8 @@ def _set_teleop_manual_control(teleop: Teleoperator | None, enabled: bool) -> No
 
 
 def _build_remote_task(task: str, acp_inference: ACPInferenceConfig) -> str:
-    """根据 ACP 推理开关生成发给远端 VLA 的最终 task 文本。"""
-    # ACP 训练出的策略推理时需要正向 Advantage 标签，远端服务端只看到这个字符串。
-    if acp_inference.enable:
-        return build_acp_tagged_task(task, is_positive=True)
+    """返回发给远端服务端的原始 task 文本。"""
+    # 为了对齐原版 human-inloop，ACP 正样本标签和 CFG 两路推理由远端服务端统一处理。
     return task
 
 
@@ -379,10 +306,16 @@ def _remote_human_inloop_loop(
     has_teleop = teleop is not None
     intervention_enabled = cfg.intervention_state_machine_enabled and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
+    zero_policy_action = dict.fromkeys(remote_client.action_names, 0.0)
     last_teleop_action: RobotAction | None = None
-    last_policy_action: RobotAction | None = None
     task = _build_remote_task(cfg.task, cfg.acp_inference)
-    logging.info("Remote inference task text:\n%s", task)
+    logging.info(
+        "Remote inference task text:\n%s\nACP inference: enable=%s use_cfg=%s cfg_beta=%s",
+        task,
+        cfg.acp_inference.enable,
+        cfg.acp_inference.use_cfg,
+        cfg.acp_inference.cfg_beta,
+    )
     start_t = time.perf_counter()
 
     if intervention_enabled:
@@ -401,13 +334,11 @@ def _remote_human_inloop_loop(
             if intervention_enabled:
                 if intervention_state == INTERVENTION_STATE_POLICY:
                     _set_teleop_manual_control(teleop, True)
-                    remote_client.clear_actions()
                     intervention_state = INTERVENTION_STATE_ACTIVE
                     logging.info("Intervention enabled: teleop actions override remote policy.")
                 else:
                     _set_teleop_manual_control(teleop, False)
-                    remote_client.clear_actions()
-                    last_policy_action = None
+                    remote_client.request_policy_reset()
                     intervention_state = INTERVENTION_STATE_RELEASE
                     logging.info("Intervention released: returning control to remote policy.")
             else:
@@ -421,13 +352,10 @@ def _remote_human_inloop_loop(
         )
         obs_processed = robot_observation_processor(obs)
 
-        if remote_client.ready_to_send_observation():
-            # 每个控制周期只发 observation，不写 dataset frame。
-            remote_client.send_observation(obs_processed, task)
-
         act_processed_policy = None
         if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
-            act_processed_policy = remote_client.pop_policy_action()
+            # 远端服务端内部按原版 preprocessor -> select_action -> postprocessor 执行。
+            act_processed_policy = remote_client.predict_action(obs_processed, task)
 
         act_processed_teleop = None
         if has_teleop:
@@ -440,13 +368,10 @@ def _remote_human_inloop_loop(
             act_processed_teleop = teleop_action_processor((teleop_action, obs))
             last_teleop_action = act_processed_teleop
 
-        if act_processed_policy is not None:
-            last_policy_action = act_processed_policy
-
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
-            action_values = act_processed_teleop or last_teleop_action or last_policy_action
+            action_values = act_processed_teleop or last_teleop_action or act_processed_policy or zero_policy_action
         else:
-            action_values = act_processed_policy or last_policy_action
+            action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
 
         if action_values is None:
             precise_sleep(max(cfg.environment_dt - (time.perf_counter() - loop_start), 0.0))
@@ -502,7 +427,6 @@ def human_inloop_remote_infer(cfg: HumanInloopRemoteInferConfig) -> None:
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
     remote_client: RemotePolicyActionClient | None = None
     policy_sync_executor: PolicySyncDualArmExecutor | None = None
-    receiver_thread: threading.Thread | None = None
     listener = None
 
     try:
@@ -522,9 +446,6 @@ def human_inloop_remote_infer(cfg: HumanInloopRemoteInferConfig) -> None:
         remote_client = RemotePolicyActionClient(cfg, robot)
         if not remote_client.start():
             raise RuntimeError("Failed to start remote policy client.")
-
-        receiver_thread = threading.Thread(target=remote_client.receive_actions, daemon=True)
-        receiver_thread.start()
 
         listener, events = init_keyboard_listener(intervention_toggle_key=cfg.intervention_toggle_key)
         logging.info(
@@ -547,8 +468,6 @@ def human_inloop_remote_infer(cfg: HumanInloopRemoteInferConfig) -> None:
         log_say("Stop human-in-loop remote inference", cfg.play_sounds, blocking=True)
         if remote_client is not None:
             remote_client.stop()
-        if receiver_thread is not None:
-            receiver_thread.join(timeout=2)
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
         if listener and hasattr(listener, "stop"):

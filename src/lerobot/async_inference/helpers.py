@@ -259,9 +259,14 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    reset_policy: bool = False
 
     def get_observation(self):
         return self.observation
+
+    def should_reset_policy(self) -> bool:
+        """判断远端服务端在本次推理前是否需要重置 policy/cache。"""
+        return self.reset_policy
 
 
 @dataclass
@@ -300,6 +305,12 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    action_names: list[str] = field(default_factory=list)
+    robot_type: str | None = None
+    inference_mode: str = "action_chunk"
+    acp_enable: bool = False
+    acp_use_cfg: bool = False
+    acp_cfg_beta: float = 1.0
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:
