@@ -227,7 +227,7 @@ def value_train(
 
     effective_batch_size = cfg.batch_size * accelerator.num_processes
     train_tracker = MetricsTracker(
-        effective_batch_size,
+        cfg.batch_size,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
