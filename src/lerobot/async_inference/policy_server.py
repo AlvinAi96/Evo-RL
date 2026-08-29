@@ -105,7 +105,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.acp_inference = ACPInferenceConfig()
         self.cond_policy_runtime_state: dict[str, Any] | None = None
         self.uncond_policy_runtime_state: dict[str, Any] | None = None
-        self.select_action_batch_size: int = 1
 
     @property
     def running(self):
@@ -153,22 +152,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
         inference_mode = getattr(policy_specs, "inference_mode", "action_chunk")
         action_names = list(getattr(policy_specs, "action_names", []))
-        select_action_batch_size = int(getattr(policy_specs, "select_action_batch_size", 1))
         if inference_mode not in {"action_chunk", "select_action"}:
             raise ValueError(f"Unsupported inference_mode: {inference_mode}")
         if inference_mode == "select_action" and not action_names:
             raise ValueError("select_action mode requires action_names from the robot client.")
-        if select_action_batch_size <= 0:
-            raise ValueError("select_action_batch_size must be positive.")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
             f"Policy type: {policy_specs.policy_type} | "
             f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
-            f"Device: {policy_specs.device} | "
-            f"Inference mode: {inference_mode} | "
-            f"Select action batch size: {select_action_batch_size}"
+            f"Device: {policy_specs.device}"
         )
 
         self.device = policy_specs.device
@@ -178,7 +172,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.action_names = action_names
         self.robot_type = getattr(policy_specs, "robot_type", None)
         self.inference_mode = inference_mode
-        self.select_action_batch_size = select_action_batch_size
         self.acp_inference = ACPInferenceConfig(
             enable=getattr(policy_specs, "acp_enable", False),
             use_cfg=getattr(policy_specs, "acp_use_cfg", False),
@@ -305,7 +298,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
             start_time = time.perf_counter()
             if self.inference_mode == "select_action":
-                action_payload = self._predict_select_action_batch(obs)
+                action_payload = self._predict_select_action(obs)
             else:
                 action_payload = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
@@ -426,6 +419,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def _predict_select_action(self, observation_t: TimedObservation) -> dict[str, float]:
         """按原版 human-inloop 的 predict_action/select_action 路径预测单步动作。"""
+        if observation_t.should_reset_policy():
+            self.logger.info("Resetting policy runtime state before observation #%s", observation_t.get_timestep())
+            self._reset_policy_runtime_state()
+
         raw_observation = dict(observation_t.get_observation())
         task = raw_observation.pop("task", "")
 
@@ -452,25 +449,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             len(action),
         )
         return action
-
-    def _predict_select_action_batch(
-        self, observation_t: TimedObservation
-    ) -> dict[str, float] | list[dict[str, float]]:
-        """基于一次 observation 连续取多个 select_action 结果，摊薄远端 RPC 开销。"""
-        if observation_t.should_reset_policy():
-            self.logger.info("Resetting policy runtime state before observation #%s", observation_t.get_timestep())
-            self._reset_policy_runtime_state()
-
-        # buffer 内每个动作仍来自 policy.select_action，区别只是一次 RPC 返回多个单步动作。
-        actions = [self._predict_select_action(observation_t) for _ in range(self.select_action_batch_size)]
-        if self.select_action_batch_size == 1:
-            return actions[0]
-        self.logger.info(
-            "Select action buffer #%s generated | buffer_size=%d",
-            observation_t.get_timestep(),
-            len(actions),
-        )
-        return actions
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
         """Predict an action chunk based on an observation.
