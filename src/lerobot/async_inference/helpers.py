@@ -89,10 +89,16 @@ def raw_observation_to_observation(
     raw_observation: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    rename_map: dict[str, str] | None = None,
 ) -> Observation:
     observation = {}
 
-    observation = prepare_raw_observation(raw_observation, lerobot_features, policy_image_features)
+    observation = prepare_raw_observation(
+        raw_observation,
+        lerobot_features,
+        policy_image_features,
+        rename_map,
+    )
     for k, v in observation.items():
         if isinstance(v, torch.Tensor):  # VLAs present natural-language instructions in observations
             if "image" in k:
@@ -144,6 +150,7 @@ def prepare_raw_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],
     policy_image_features: dict[str, PolicyFeature],
+    rename_map: dict[str, str] | None = None,
 ) -> Observation:
     """Matches keys from the raw robot_obs dict to the keys expected by a given policy (passed as
     policy_image_features)."""
@@ -162,7 +169,10 @@ def prepare_raw_observation(
     # Turns the image features to (C, H, W) with H, W matching the policy image features.
     # This reduces the resolution of the images
     image_dict = {
-        key: resize_robot_observation_image(torch.tensor(lerobot_obs[key]), policy_image_features[key].shape)
+        key: resize_robot_observation_image(
+            torch.tensor(lerobot_obs[key]),
+            _resolve_policy_image_shape(key, policy_image_features, rename_map),
+        )
         for key in image_keys
     }
 
@@ -170,6 +180,26 @@ def prepare_raw_observation(
         state_dict["task"] = robot_obs["task"]
 
     return {**state_dict, **image_dict}
+
+
+def _resolve_policy_image_shape(
+    image_key: str,
+    policy_image_features: dict[str, PolicyFeature],
+    rename_map: dict[str, str] | None,
+) -> tuple[int, int, int]:
+    """按训练时保存的 rename_map 查找 policy 期望的图像尺寸。"""
+    # 先按预处理器里的重命名关系找目标图像 key，兼容 front -> base_0_rgb 这类映射。
+    target_key = rename_map.get(image_key, image_key) if rename_map else image_key
+    if target_key in policy_image_features:
+        return policy_image_features[target_key].shape
+    if image_key in policy_image_features:
+        return policy_image_features[image_key].shape
+
+    available = sorted(policy_image_features)
+    raise KeyError(
+        f"Image key '{image_key}' is not compatible with policy image features. "
+        f"Tried renamed key '{target_key}'. Available policy image keys: {available}"
+    )
 
 
 def get_logger(name: str, log_to_file: bool = True) -> logging.Logger:

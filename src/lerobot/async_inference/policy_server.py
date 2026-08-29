@@ -43,6 +43,7 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
 )
+from lerobot.processor.rename_processor import RenameObservationsProcessorStep
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -89,6 +90,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self.rename_map: dict[str, str] = {}
 
     @property
     def running(self):
@@ -156,21 +158,40 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
+        preprocessor_overrides = {"device_processor": device_override}
+        if policy_specs.rename_map:
+            # 客户端显式传入时才覆盖模型目录里的 rename 配置。
+            # 这样可以避免把已保存的映射清空。
+            preprocessor_overrides["rename_observations_processor"] = {
+                "rename_map": policy_specs.rename_map
+            }
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
+        self.rename_map = self._extract_rename_map(self.preprocessor)
+        self.logger.info("Loaded preprocessor rename_map: %s", self.rename_map)
 
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
+
+    def _extract_rename_map(
+        self, preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None
+    ) -> dict[str, str]:
+        """读取 policy preprocessor 中保存的 observation 重命名关系。"""
+        # 从已加载的预处理器中读取图像重命名关系。
+        # 这个映射会供 raw observation resize 阶段使用。
+        if preprocessor is None:
+            return {}
+        for step in preprocessor.steps:
+            if isinstance(step, RenameObservationsProcessorStep):
+                return dict(step.rename_map)
+        return {}
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
@@ -345,6 +366,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            rename_map=self.rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 
