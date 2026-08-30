@@ -26,12 +26,14 @@ from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import pad_vector
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
+    AbsoluteActionsProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
     ProcessorStepRegistry,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
@@ -130,9 +132,16 @@ def make_pi05_pre_post_processors(
     """
 
     # Add remaining processors
+    relative_actions_processor = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=config.relative_exclude_joints,
+        action_names=config.action_feature_names,
+    )
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        # 相对动作模式下，先把绝对标注 action 转成相对当前 state 的增量再做归一化。
+        relative_actions_processor,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -153,6 +162,11 @@ def make_pi05_pre_post_processors(
     output_steps: list[ProcessorStep] = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+        ),
+        # 推理时若模型输出相对动作，这里用最近一次 observation.state 恢复回绝对关节目标。
+        AbsoluteActionsProcessorStep(
+            enabled=config.use_relative_actions,
+            relative_step=relative_actions_processor,
         ),
         DeviceProcessorStep(device="cpu"),
     ]

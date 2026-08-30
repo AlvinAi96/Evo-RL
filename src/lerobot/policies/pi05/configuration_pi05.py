@@ -50,6 +50,12 @@ class PI05Config(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
+    # Relative-action settings.
+    # 训练/推理都允许 checkpoint 显式声明“模型输出是相对动作，再由 postprocessor 恢复成绝对动作”。
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    action_feature_names: list[str] | None = None
+
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
