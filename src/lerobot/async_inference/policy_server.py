@@ -203,6 +203,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         self.rename_map = self._extract_rename_map(self.preprocessor)
         self.logger.info("Loaded preprocessor rename_map: %s", self.rename_map)
+        self._log_action_space_mode(self.preprocessor, self.postprocessor)
         self._reset_policy_runtime_state()
 
         end = time.perf_counter()
@@ -239,6 +240,61 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             if isinstance(step, RenameObservationsProcessorStep):
                 return dict(step.rename_map)
         return {}
+
+    def _log_action_space_mode(
+        self,
+        preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None,
+        postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None,
+    ) -> None:
+        """打印 checkpoint 的动作空间模式，确认当前是绝对动作还是相对动作恢复链路。"""
+        from lerobot.processor.relative_action_processor import (
+            AbsoluteActionsProcessorStep,
+            RelativeActionsProcessorStep,
+        )
+
+        relative_step = None
+        absolute_step = None
+        if preprocessor is not None:
+            relative_step = next(
+                (step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)),
+                None,
+            )
+        if postprocessor is not None:
+            absolute_step = next(
+                (step for step in postprocessor.steps if isinstance(step, AbsoluteActionsProcessorStep)),
+                None,
+            )
+
+        use_relative_actions = bool(getattr(self.policy.config, "use_relative_actions", False))
+        relative_enabled = bool(relative_step.enabled) if relative_step is not None else False
+        absolute_enabled = bool(absolute_step.enabled) if absolute_step is not None else False
+
+        if relative_enabled and absolute_enabled:
+            mode = "relative->absolute"
+        elif relative_enabled and not absolute_enabled:
+            mode = "relative-only"
+        else:
+            mode = "absolute"
+
+        self.logger.info(
+            "Resolved action space mode: %s | config.use_relative_actions=%s | "
+            "pre.relative_enabled=%s | post.absolute_enabled=%s",
+            mode,
+            use_relative_actions,
+            relative_enabled,
+            absolute_enabled,
+        )
+
+        # 不强行报错，保留对老 checkpoint/自定义 processor 的兼容性，但把潜在错配显式打出来。
+        if use_relative_actions and not (relative_enabled and absolute_enabled):
+            self.logger.warning(
+                "Checkpoint config indicates relative actions, but processor chain is incomplete. "
+                "Expected relative_actions_processor + absolute_actions_processor."
+            )
+        if not use_relative_actions and (relative_enabled or absolute_enabled):
+            self.logger.warning(
+                "Checkpoint config indicates absolute actions, but relative/absolute processors are enabled."
+            )
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
