@@ -114,6 +114,8 @@ def record_loop(
     acp_inference: ACPInferenceConfig | None = None,
     communication_retry_timeout_s: float = 2.0,
     communication_retry_interval_s: float = 0.1,
+    predict_policy_action: Callable[[RobotObservation, str], RobotAction | None] | None = None,
+    reset_policy_runtime: Callable[[], None] | None = None,
 ):
     if acp_inference is None:
         acp_inference = ACPInferenceConfig()
@@ -146,7 +148,10 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    if dataset is None and policy is not None:
+    has_local_policy_backend = policy is not None and preprocessor is not None and postprocessor is not None
+    has_policy_backend = has_local_policy_backend or predict_policy_action is not None
+
+    if dataset is None and has_policy_backend:
         raise ValueError("Policy-driven recording requires a dataset for feature mapping.")
 
     action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
@@ -157,7 +162,7 @@ def record_loop(
             action_feature_names = list(robot.action_features)
     zero_policy_action = dict.fromkeys(action_feature_names, 0.0)
     has_teleop = isinstance(teleop, (Teleoperator, list))
-    intervention_enabled = intervention_state_machine_enabled and policy is not None and has_teleop
+    intervention_enabled = intervention_state_machine_enabled and has_policy_backend and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
     teleop_fallback_warned = False
@@ -179,11 +184,19 @@ def record_loop(
         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
         set_teleop_manual_control(True)
 
-    # Reset policy and processor if they are provided
-    if policy is not None and preprocessor is not None and postprocessor is not None:
-        policy.reset()
-        preprocessor.reset()
-        postprocessor.reset()
+    def reset_policy_backend() -> None:
+        """重置 policy 运行态，确保新 episode/接管释放后不会串用旧缓存。"""
+        if reset_policy_runtime is not None:
+            reset_policy_runtime()
+            return
+        if has_local_policy_backend:
+            policy.reset()
+            preprocessor.reset()
+            postprocessor.reset()
+
+    # 每个 episode 开始前都重置一次 policy 运行态，避免 chunk/buffer 跨集残留。
+    if has_policy_backend:
+        reset_policy_backend()
 
     cond_policy_runtime_state: dict[str, Any] | None = None
     uncond_policy_runtime_state: dict[str, Any] | None = None
@@ -254,14 +267,12 @@ def record_loop(
                 else:
                     set_teleop_manual_control(False)
                     intervention_state = INTERVENTION_STATE_RELEASE
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
-                        policy.reset()
-                        preprocessor.reset()
-                        postprocessor.reset()
+                    if has_policy_backend:
+                        reset_policy_backend()
                         if acp_inference.enable and acp_inference.use_cfg:
                             cond_policy_runtime_state = _capture_policy_runtime_state(policy)
                             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
-                    if policy is not None and preprocessor is not None and postprocessor is not None:
+                    if has_policy_backend:
                         logging.info("Policy cache reset on release: next policy action is recomputed.")
                     logging.info("Intervention release requested (S2): returning control to policy.")
             else:
@@ -279,26 +290,25 @@ def record_loop(
         # Get action from policy and/or teleop
         act_processed_policy: RobotAction | None = None
         act_processed_teleop: RobotAction | None = None
-        if (
-            policy is not None
-            and preprocessor is not None
-            and postprocessor is not None
-            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
-        ):
-            policy_action = _predict_policy_action_with_acp_inference(
-                observation_frame=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-                acp_inference=acp_inference,
-                cond_runtime_state=cond_policy_runtime_state,
-                uncond_runtime_state=uncond_policy_runtime_state,
-            )
-            act_processed_policy = make_robot_action(policy_action, dataset.features)
+        if has_policy_backend and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+            if predict_policy_action is not None:
+                # 远端模式下复用 record_loop 的时序与落盘逻辑，只把 policy 动作来源替换成 gRPC 服务。
+                act_processed_policy = predict_policy_action(obs_processed, single_task or "")
+            else:
+                policy_action = _predict_policy_action_with_acp_inference(
+                    observation_frame=observation_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=single_task,
+                    robot_type=robot.robot_type,
+                    acp_inference=acp_inference,
+                    cond_runtime_state=cond_policy_runtime_state,
+                    uncond_runtime_state=uncond_policy_runtime_state,
+                )
+                act_processed_policy = make_robot_action(policy_action, dataset.features)
 
         if isinstance(teleop, Teleoperator):
             act = run_with_connection_retry("teleop.get_action", teleop.get_action)

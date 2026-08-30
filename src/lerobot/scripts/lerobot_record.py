@@ -367,6 +367,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     dataset = None
     listener = None
     policy_sync_executor = None
+    policy_runtime = None
 
     try:
         if cfg.resume:
@@ -399,13 +400,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 vcodec=cfg.dataset.vcodec,
             )
 
+        build_policy_runtime = getattr(cfg, "_build_policy_runtime", None)
+        if callable(build_policy_runtime):
+            # 允许上层脚本注入远端 policy runtime，同时保留 record() 原有的数据集与 episode 主流程。
+            policy_runtime = build_policy_runtime(robot)
+
         # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        if cfg.policy is not None and policy_runtime is not None:
+            logging.warning("Custom policy runtime is configured; skipping local policy loading from `cfg.policy`.")
+        policy = None if (cfg.policy is None or policy_runtime is not None) else make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
-        if cfg.acp_inference.enable and cfg.policy is None:
+        if cfg.acp_inference.enable and cfg.policy is None and policy_runtime is None:
             raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
-        if cfg.policy is not None:
+        if cfg.policy is not None and policy_runtime is None:
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
@@ -429,10 +437,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         on_record_connected = getattr(cfg, "_on_record_connected", None)
         if callable(on_record_connected):
             on_record_connected(robot, teleop)
+        if policy_runtime is not None and not policy_runtime.start():
+            raise RuntimeError("Failed to start custom policy runtime.")
 
         if cfg.policy_sync_to_teleop:
-            if cfg.policy is None:
-                raise ValueError("`policy_sync_to_teleop=true` requires `policy` to be set.")
+            if cfg.policy is None and policy_runtime is None:
+                raise ValueError("`policy_sync_to_teleop=true` requires a policy backend to be set.")
             if teleop is None or isinstance(teleop, list):
                 raise ValueError(
                     "`policy_sync_to_teleop=true` requires exactly one teleoperator with send_feedback support."
@@ -480,6 +490,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     acp_inference=cfg.acp_inference,
                     communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                     communication_retry_interval_s=cfg.communication_retry_interval_s,
+                    predict_policy_action=(
+                        policy_runtime.predict_action if policy_runtime is not None else None
+                    ),
+                    reset_policy_runtime=(
+                        policy_runtime.request_policy_reset if policy_runtime is not None else None
+                    ),
                 )
 
                 episode_success = None
@@ -566,6 +582,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         if policy_sync_executor is not None:
             policy_sync_executor.shutdown()
+
+        if policy_runtime is not None:
+            # 先停远端动作流，再断开串口，避免后台线程在退出阶段继续取用旧硬件句柄。
+            policy_runtime.stop()
 
         if robot.is_connected:
             robot.disconnect()
