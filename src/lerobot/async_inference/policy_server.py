@@ -153,9 +153,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
         inference_mode = getattr(policy_specs, "inference_mode", "action_chunk")
         action_names = list(getattr(policy_specs, "action_names", []))
-        if inference_mode not in {"action_chunk", "select_action"}:
+        # 兼容原有 chunk/单步模式，以及新增的本地 buffer 补货模式。
+        if inference_mode not in {"action_chunk", "select_action", "select_action_buffered"}:
             raise ValueError(f"Unsupported inference_mode: {inference_mode}")
-        if inference_mode == "select_action" and not action_names:
+        if inference_mode in {"select_action", "select_action_buffered"} and not action_names:
             raise ValueError("select_action mode requires action_names from the robot client.")
 
         self.logger.info(
