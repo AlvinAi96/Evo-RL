@@ -208,7 +208,8 @@ def wrap(config_path: Path | None = None) -> Callable[[F], F]:
         def wrapper_inner(*args: Any, **kwargs: Any) -> Any:
             argspec = inspect.getfullargspec(fn)
             argtype = argspec.annotations[argspec.args[0]]
-            if len(args) > 0 and type(args[0]) is argtype:
+            # 中文说明：允许 RecordConfig 子类直接复用被 @parser.wrap 包装的 record()，避免二次按父类重解析。
+            if len(args) > 0 and isinstance(args[0], argtype):
                 cfg = args[0]
                 args = args[1:]
             else:

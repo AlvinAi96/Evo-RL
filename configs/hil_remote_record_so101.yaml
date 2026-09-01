@@ -1,0 +1,46 @@
+robot:
+  type: so101_follower
+  port: /dev/tty.usbmodem5B790505591
+  id: hongfeng_follower_arm
+  cameras:
+    front:
+      type: opencv
+      index_or_path: 0
+      width: 640
+      height: 480
+      fps: 30
+      warmup_s: 10
+    side:
+      type: opencv
+      index_or_path: 1
+      width: 640
+      height: 480
+      fps: 30
+      warmup_s: 10
+
+teleop:
+  type: so101_leader
+  port: /dev/tty.usbmodem5B790500991
+  id: hongfeng_leader_arm
+
+dataset:
+  repo_id: AlvinAi/insert_carrot_into_the_hole_hil_r2
+  root: /Users/bytedance/lerobot_dataset_0824_hil_r2
+  single_task: insert carrot into the hole
+  num_episodes: 80
+  episode_time_s: 120
+  reset_time_s: 2
+  push_to_hub: false
+  vcodec: h264
+
+display_data: false
+resume: false
+
+pretrained_name_or_path: /root/autodl-tmp/models/pistar06_insert_carrot_into_the_hole_acp_r1_epoch10/
+policy_type: pi05
+server_address: 127.0.0.1:8000
+actions_per_chunk: 50
+policy_device: cuda
+
+acp_inference:
+  enable: true
