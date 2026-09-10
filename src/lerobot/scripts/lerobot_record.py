@@ -81,7 +81,7 @@ from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_featur
 from lerobot.datasets.utils import combine_feature_dicts
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
-from lerobot.processor import make_default_processors
+from lerobot.processor import ImageBorderConfig, make_default_processors
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
@@ -205,6 +205,8 @@ class RecordConfig:
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
+    # 可选图像内边框；在写 dataset、Rerun 展示和 policy 推理前统一生效。
+    image_border: ImageBorderConfig = field(default_factory=ImageBorderConfig)
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -337,7 +339,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    # 采集前统一构造 observation processor，确保 dataset、Rerun 和 policy 输入看到同一份图像。
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
+        image_border=cfg.image_border
+    )
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(

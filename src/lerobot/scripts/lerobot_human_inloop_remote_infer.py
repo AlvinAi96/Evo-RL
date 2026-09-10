@@ -21,6 +21,7 @@
 
 import logging
 import pickle  # nosec
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from typing import Any, TypeVar
 import grpc
 import rerun as rr
 
+from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.async_inference.helpers import (
     BufferedActions,
     RawObservation,
@@ -42,7 +44,7 @@ from lerobot.async_inference.helpers import (
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
-from lerobot.processor import RobotAction, make_default_processors
+from lerobot.processor import ImageBorderConfig, RobotAction, make_default_processors
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -93,6 +95,12 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 T = TypeVar("T")
 
+SUPPORTED_REMOTE_INFERENCE_MODES = {
+    "select_action",
+    "select_action_buffered",
+    "select_action_buffered_async",
+}
+
 
 @dataclass
 class HumanInloopRemoteInferConfig:
@@ -106,6 +114,7 @@ class HumanInloopRemoteInferConfig:
     actions_per_chunk: int = 50
     policy_device: str = "cuda"
     client_device: str = "cpu"
+    inference_mode: str = "select_action_buffered"
     chunk_size_threshold: float = 0.5
     aggregate_fn_name: str = "conservative"
     fps: int = 30
@@ -115,6 +124,7 @@ class HumanInloopRemoteInferConfig:
     display_ip: str | None = None
     display_port: int | None = None
     display_compressed_images: bool = False
+    image_border: ImageBorderConfig = field(default_factory=ImageBorderConfig)
     play_sounds: bool = True
     policy_sync_to_teleop: bool = True
     policy_sync_parallel: bool = True
@@ -133,6 +143,14 @@ class HumanInloopRemoteInferConfig:
             raise ValueError("`pretrained_name_or_path` cannot be empty.")
         if self.actions_per_chunk <= 0:
             raise ValueError("`actions_per_chunk` must be positive.")
+        if self.inference_mode not in SUPPORTED_REMOTE_INFERENCE_MODES:
+            raise ValueError(
+                f"`inference_mode` must be one of {sorted(SUPPORTED_REMOTE_INFERENCE_MODES)}, "
+                f"got {self.inference_mode!r}."
+            )
+        if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
+            raise ValueError("`chunk_size_threshold` must be between 0 and 1.")
+        get_aggregate_function(self.aggregate_fn_name)
         if self.fps <= 0:
             raise ValueError("`fps` must be positive.")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
@@ -154,6 +172,10 @@ class RemotePolicyActionClient:
     def __init__(self, cfg: HumanInloopRemoteInferConfig, robot: Robot):
         """基于本地 robot schema 构造远端 policy 所需的特征描述。"""
         self.cfg = cfg
+        self.inference_mode = getattr(cfg, "inference_mode", "select_action_buffered")
+        self.aggregate_fn = get_aggregate_function(
+            getattr(cfg, "aggregate_fn_name", "conservative")
+        )
         self.action_names = list(robot.action_features)
         self.policy_config = RemotePolicyConfig(
             policy_type=cfg.policy_type,
@@ -163,7 +185,7 @@ class RemotePolicyActionClient:
             device=cfg.policy_device,
             action_names=self.action_names,
             robot_type=robot.robot_type,
-            inference_mode="select_action_buffered",
+            inference_mode=self.inference_mode,
             acp_enable=cfg.acp_inference.enable,
             acp_use_cfg=cfg.acp_inference.use_cfg,
             acp_cfg_beta=cfg.acp_inference.cfg_beta,
@@ -176,6 +198,11 @@ class RemotePolicyActionClient:
         self.latest_action = -1
         self.reset_policy_on_next_observation = False
         self._buffered_actions: deque[TimedAction] = deque()
+        self._buffer_lock = threading.Lock()
+        self._async_request_lock = threading.Lock()
+        self._async_request_in_flight = False
+        self._request_generation = 0
+        self._async_thread: threading.Thread | None = None
 
     @property
     def running(self) -> bool:
@@ -200,11 +227,18 @@ class RemotePolicyActionClient:
         """停止本地客户端并关闭 gRPC channel。"""
         self._running = False
         self.channel.close()
+        if self._async_thread is not None and self._async_thread.is_alive():
+            # 退出时短暂等待后台请求线程收尾，避免关闭 channel 后仍继续合并旧动作。
+            self._async_thread.join(timeout=1.0)
 
     def request_policy_reset(self) -> None:
-        """标记下一次远端推理前重置 policy/preprocessor/postprocessor 缓存，并清空本地动作缓存。"""
+        """标记下一次远端推理前重置 policy 运行态，并清空本地动作缓存。"""
         self.reset_policy_on_next_observation = True
-        self._buffered_actions.clear()
+        with self._buffer_lock:
+            self._buffered_actions.clear()
+        with self._async_request_lock:
+            # bump generation 后，旧的后台响应即使回来也会被丢弃。
+            self._request_generation += 1
 
     def send_observation(self, observation: RawObservation, task: str) -> bool:
         """把当前 observation 和 task 打包成 TimedObservation 发给远端。"""
@@ -222,7 +256,7 @@ class RemotePolicyActionClient:
             reset_policy=self.reset_policy_on_next_observation,
         )
         try:
-            # 将当前 observation 发到远端 VLA 服务，远端按原版 select_action 路径推理单步动作。
+            # 将 observation 发到远端 VLA 服务，远端按指定 inference_mode 推理动作。
             observation_iterator = send_bytes_in_chunks(
                 pickle.dumps(timed_observation),
                 services_pb2.Observation,
@@ -289,20 +323,149 @@ class RemotePolicyActionClient:
         buffered_actions = self.get_policy_actions()
         if buffered_actions is None:
             return False
-        self._buffered_actions = deque(buffered_actions.get_actions())
+        with self._buffer_lock:
+            self._buffered_actions = deque(buffered_actions.get_actions())
         logging.info(
             "Received buffered remote actions for observation #%s | buffered_actions=%d",
             buffered_actions.get_observation_timestep(),
-            len(self._buffered_actions),
+            len(buffered_actions.get_actions()),
         )
-        return len(self._buffered_actions) > 0
+        return len(buffered_actions.get_actions()) > 0
+
+    def _is_async_mode(self) -> bool:
+        """判断当前是否启用提前补货和新旧动作融合。"""
+        return self.inference_mode == "select_action_buffered_async"
+
+    def _buffer_size(self) -> int:
+        """读取本地待执行动作数量。"""
+        with self._buffer_lock:
+            return len(self._buffered_actions)
+
+    def _async_request_running(self) -> bool:
+        """判断是否已有后台补货请求在进行中。"""
+        with self._async_request_lock:
+            return self._async_request_in_flight
+
+    def _ready_to_send_observation(self) -> bool:
+        """根据 chunk_size_threshold 判断是否应该提前发送新 observation。"""
+        buffer_size = self._buffer_size()
+        return buffer_size / self.cfg.actions_per_chunk <= self.cfg.chunk_size_threshold
+
+    def _aggregate_action_values(
+        self,
+        old_action: RobotAction,
+        new_action: RobotAction,
+    ) -> RobotAction:
+        """对同一个 timestep 的新旧 dict action 做逐关节融合。"""
+        fused_action: RobotAction = {}
+        # 逐 key 融合复用原生 async 权重，同时保留 send_action 需要的 dict 结构。
+        for key in old_action.keys() | new_action.keys():
+            if key not in old_action:
+                fused_action[key] = new_action[key]
+            elif key not in new_action:
+                fused_action[key] = old_action[key]
+            else:
+                fused_action[key] = self.aggregate_fn(old_action[key], new_action[key])
+        return fused_action
+
+    def _merge_buffered_actions(self, incoming_actions: list[TimedAction]) -> None:
+        """按 timestep 合并后台动作，重叠位置做 temporal ensemble。"""
+        if len(incoming_actions) == 0:
+            return
+
+        with self._buffer_lock:
+            current_actions = {
+                action.get_timestep(): action
+                for action in self._buffered_actions
+                if action.get_timestep() > self.latest_action
+            }
+
+            for incoming_action in incoming_actions:
+                timestep = incoming_action.get_timestep()
+                if timestep <= self.latest_action:
+                    continue
+
+                current_action = current_actions.get(timestep)
+                if current_action is None:
+                    current_actions[timestep] = incoming_action
+                    continue
+
+                old_action = current_action.get_action()
+                new_action = incoming_action.get_action()
+                if not isinstance(old_action, dict) or not isinstance(new_action, dict):
+                    raise TypeError("select_action_buffered_async expects dict robot actions.")
+
+                # 同一未来 timestep 被新旧 observation 都预测到时，做平滑融合。
+                current_actions[timestep] = TimedAction(
+                    timestamp=incoming_action.get_timestamp(),
+                    timestep=timestep,
+                    action=self._aggregate_action_values(old_action, new_action),
+                )
+
+            self._buffered_actions = deque(
+                current_actions[timestep] for timestep in sorted(current_actions)
+            )
+
+        logging.info(
+            "Merged async remote actions | incoming_actions=%d | buffer_size=%d",
+            len(incoming_actions),
+            self._buffer_size(),
+        )
+
+    def _async_refill_action_buffer(
+        self,
+        observation: RawObservation,
+        task: str,
+        request_generation: int,
+    ) -> None:
+        """后台发送 observation 并接收动作，回来后和本地未来动作队列融合。"""
+        try:
+            if not self.send_observation(observation, task):
+                return
+            buffered_actions = self.get_policy_actions()
+            if buffered_actions is None:
+                return
+            with self._async_request_lock:
+                if request_generation != self._request_generation:
+                    logging.info("Discarding stale async remote actions after policy reset.")
+                    return
+            self._merge_buffered_actions(buffered_actions.get_actions())
+        finally:
+            with self._async_request_lock:
+                self._async_request_in_flight = False
+
+    def _maybe_start_async_refill(self, observation: RawObservation, task: str) -> None:
+        """buffer 低于阈值时异步请求新动作，主循环不等待远端推理。"""
+        if not self._is_async_mode() or not self._ready_to_send_observation():
+            return
+
+        with self._async_request_lock:
+            if self._async_request_in_flight:
+                return
+            self._async_request_in_flight = True
+            request_generation = self._request_generation
+
+        # observation 复制一份交给后台线程，避免主循环后续改动同一个 dict。
+        async_observation = dict(observation)
+        self._async_thread = threading.Thread(
+            target=self._async_refill_action_buffer,
+            args=(async_observation, task, request_generation),
+            daemon=True,
+        )
+        self._async_thread.start()
 
     def predict_action(self, observation: RawObservation, task: str) -> RobotAction | None:
-        """按原版 select_action 队列边界整段补货，再从本地 buffer 逐步取一个动作执行。"""
-        if len(self._buffered_actions) == 0 and not self._refill_action_buffer(observation, task):
-            return None
+        """按 select_action 队列边界补货，再从本地 buffer 逐步取动作执行。"""
+        if self._buffer_size() == 0:
+            if self._is_async_mode() and self._async_request_running():
+                # 后台推理已在进行中，本周期不再发第二个同步请求，避免抢响应。
+                return None
+            if not self._refill_action_buffer(observation, task):
+                return None
 
-        timed_action = self._buffered_actions.popleft()
+        self._maybe_start_async_refill(observation, task)
+        with self._buffer_lock:
+            timed_action = self._buffered_actions.popleft()
         self.latest_action = timed_action.get_timestep()
         action = timed_action.get_action()
         if not isinstance(action, dict):
@@ -361,7 +524,10 @@ def _remote_human_inloop_loop(
     display_compressed_images: bool,
 ) -> None:
     """执行不写数据集的 HIL 控制循环。"""
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    # 纯远程推理也复用边框 processor，保证与重新采集/训练的数据分布一致。
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
+        image_border=cfg.image_border
+    )
     has_teleop = teleop is not None
     intervention_enabled = cfg.intervention_state_machine_enabled and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY

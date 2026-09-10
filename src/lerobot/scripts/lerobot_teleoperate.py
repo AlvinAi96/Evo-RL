@@ -54,7 +54,7 @@ lerobot-teleoperate \
 import logging
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pprint import pformat
 
 import rerun as rr
@@ -63,6 +63,7 @@ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # no
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
+    ImageBorderConfig,
     IdentityProcessorStep,
     RobotAction,
     RobotObservation,
@@ -130,6 +131,8 @@ class TeleoperateConfig:
     display_port: int | None = None
     # Whether to  display compressed images in Rerun
     display_compressed_images: bool = False
+    # 可选图像内边框；主要用于 Rerun 预览采集前的视觉效果。
+    image_border: ImageBorderConfig = field(default_factory=ImageBorderConfig)
 
 
 def _processor_pipeline_needs_observation(
@@ -261,7 +264,10 @@ def teleoperate(cfg: TeleoperateConfig):
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    # 遥操预览使用同一套 observation processor，便于录制前检查边框效果。
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
+        image_border=cfg.image_border
+    )
     should_fetch_obs = _teleop_needs_robot_observation(
         cfg.display_data, teleop_action_processor, robot_action_processor
     )

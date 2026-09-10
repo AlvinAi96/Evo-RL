@@ -21,6 +21,7 @@ from .converters import (
     transition_to_robot_action,
 )
 from .core import RobotAction, RobotObservation
+from .image_border_processor import ImageBorderConfig, ImageBorderProcessorStep
 from .pipeline import IdentityProcessorStep, RobotProcessorPipeline
 
 
@@ -46,17 +47,34 @@ def make_default_robot_action_processor() -> RobotProcessorPipeline[
     return robot_action_processor
 
 
-def make_default_robot_observation_processor() -> RobotProcessorPipeline[RobotObservation, RobotObservation]:
+def make_default_robot_observation_processor(
+    image_border: ImageBorderConfig | None = None,
+) -> RobotProcessorPipeline[RobotObservation, RobotObservation]:
+    """构造机器人 observation pipeline；默认不改图，按配置可插入图像边框步骤。"""
+    steps = []
+    if image_border is not None and image_border.enable and image_border.width_px > 0:
+        # 在原始相机图像阶段加边框，后续 dataset/Rerun/policy 都能看到同一份 observation。
+        steps.append(
+            ImageBorderProcessorStep(
+                width_px=image_border.width_px,
+                color_rgb=image_border.color_rgb,
+                keys=image_border.keys,
+            )
+        )
+    if not steps:
+        steps = [IdentityProcessorStep()]
+
     robot_observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
-        steps=[IdentityProcessorStep()],
+        steps=steps,
         to_transition=observation_to_transition,
         to_output=transition_to_observation,
     )
     return robot_observation_processor
 
 
-def make_default_processors():
+def make_default_processors(image_border: ImageBorderConfig | None = None):
+    """构造默认 action/observation processors；图像边框只影响 observation 分支。"""
     teleop_action_processor = make_default_teleop_action_processor()
     robot_action_processor = make_default_robot_action_processor()
-    robot_observation_processor = make_default_robot_observation_processor()
+    robot_observation_processor = make_default_robot_observation_processor(image_border=image_border)
     return (teleop_action_processor, robot_action_processor, robot_observation_processor)

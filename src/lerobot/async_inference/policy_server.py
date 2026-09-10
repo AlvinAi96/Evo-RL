@@ -154,10 +154,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         inference_mode = getattr(policy_specs, "inference_mode", "action_chunk")
         action_names = list(getattr(policy_specs, "action_names", []))
         # 兼容原有 chunk/单步模式，以及新增的本地 buffer 补货模式。
-        if inference_mode not in {"action_chunk", "select_action", "select_action_buffered"}:
+        if inference_mode not in {
+            "action_chunk",
+            "select_action",
+            "select_action_buffered",
+            "select_action_buffered_async",
+        }:
             raise ValueError(f"Unsupported inference_mode: {inference_mode}")
-        if inference_mode in {"select_action", "select_action_buffered"} and not action_names:
+        if (
+            inference_mode in {"select_action", "select_action_buffered", "select_action_buffered_async"}
+            and not action_names
+        ):
             raise ValueError("select_action mode requires action_names from the robot client.")
+        if policy_specs.actions_per_chunk <= 0:
+            raise ValueError("actions_per_chunk must be positive.")
 
         self.logger.info(
             f"Receiving policy instructions from {client_id} | "
@@ -357,7 +367,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             start_time = time.perf_counter()
             if self.inference_mode == "select_action":
                 action_payload = self._predict_select_action(obs)
-            elif self.inference_mode == "select_action_buffered":
+            elif self.inference_mode in {"select_action_buffered", "select_action_buffered_async"}:
                 action_payload = self._predict_select_action_buffered(obs)
             else:
                 action_payload = self._predict_action_chunk(obs)
@@ -418,7 +428,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """Enqueue an observation if it must go through processing, otherwise skip it.
         Observations not in queue are never run through the policy network"""
 
-        if self.inference_mode in {"select_action", "select_action_buffered"}:
+        if self.inference_mode in {"select_action", "select_action_buffered", "select_action_buffered_async"}:
             # HIL 对齐模式不做 async 的相似帧过滤；原版 human-inloop 每轮都会用当前观测推理。
             if self.observation_queue.full():
                 _ = self.observation_queue.get_nowait()
@@ -517,10 +527,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return None
         return action_queue.popleft()
 
+    def _clear_buffered_select_actions(self, runtime_state: dict[str, Any] | None = None) -> None:
+        """丢弃 select_action 内部未返回的旧动作，确保下一次 observation 会触发新推理。"""
+        action_queue = self._get_select_action_queue(runtime_state)
+        if action_queue is not None:
+            action_queue.clear()
+
     def _predict_select_action(self, observation_t: TimedObservation) -> dict[str, float]:
         """按原版 human-inloop 的 predict_action/select_action 路径预测单步动作。"""
         if observation_t.should_reset_policy():
-            self.logger.info("Resetting policy runtime state before observation #%s", observation_t.get_timestep())
+            self.logger.info(
+                "Resetting policy runtime state before observation #%s",
+                observation_t.get_timestep(),
+            )
             self._reset_policy_runtime_state()
 
         raw_observation = dict(observation_t.get_observation())
@@ -553,7 +572,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     def _predict_select_action_buffered(self, observation_t: TimedObservation) -> BufferedActions:
         """按原版 select_action 的队列边界，一次返回当前 observation 对应的一整段动作。"""
         if observation_t.should_reset_policy():
-            self.logger.info("Resetting policy runtime state before observation #%s", observation_t.get_timestep())
+            self.logger.info(
+                "Resetting policy runtime state before observation #%s",
+                observation_t.get_timestep(),
+            )
             self._reset_policy_runtime_state()
 
         raw_observation = dict(observation_t.get_observation())
@@ -576,13 +598,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 uncond_runtime_state=self.uncond_policy_runtime_state,
             )
         ]
+        # 第一拍来自 select_action 返回值；后续最多补到 actions_per_chunk。
+        # 截断后会清空 policy 内部剩余 queue，避免继续被 n_action_steps 固定住。
+        max_remaining_actions = max(self.actions_per_chunk - len(action_tensors), 0)
 
-        # 后续动作直接从本次 select_action 已经生成好的内部队列里取，避免重复跑 preprocess。
-        # 这里按“原版队列耗尽”为边界，不截断成更短的 chunk，避免破坏 select_action 语义。
+        # 后续动作直接从本次 select_action 已经生成好的内部队列里取。
+        # 这里保留 select_action 的 processor/ACP 语义，同时按客户端 actions_per_chunk 截断。
         if self.acp_inference.enable and self.acp_inference.use_cfg:
             remaining = min(
                 self._get_available_buffered_select_actions(self.cond_policy_runtime_state),
                 self._get_available_buffered_select_actions(self.uncond_policy_runtime_state),
+                max_remaining_actions,
             )
             for _ in range(remaining):
                 cond_action = self._pop_buffered_select_action(self.cond_policy_runtime_state)
@@ -594,13 +620,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 action_tensors.append(
                     processed_uncond + self.acp_inference.cfg_beta * (processed_cond - processed_uncond)
                 )
+            # 截断后，剩余旧动作不再保留，下一次请求必须基于新 observation 重推理。
+            self._clear_buffered_select_actions(self.cond_policy_runtime_state)
+            self._clear_buffered_select_actions(self.uncond_policy_runtime_state)
         else:
-            remaining = self._get_available_buffered_select_actions()
+            remaining = min(
+                self._get_available_buffered_select_actions(),
+                max_remaining_actions,
+            )
             for _ in range(remaining):
                 queued_action = self._pop_buffered_select_action()
                 if queued_action is None:
                     break
                 action_tensors.append(self.postprocessor(queued_action))
+            # 截断后，剩余旧动作不再保留，下一次请求必须基于新 observation 重推理。
+            self._clear_buffered_select_actions()
 
         buffered_actions = [
             TimedAction(

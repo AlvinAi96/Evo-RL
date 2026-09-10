@@ -49,6 +49,7 @@ import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.processor import make_default_robot_observation_processor
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -96,6 +97,10 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        # 直接 async client 不经过 record_loop，这里单独接入 observation processor。
+        self.robot_observation_processor = make_default_robot_observation_processor(
+            image_border=config.image_border
+        )
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -412,7 +417,8 @@ class RobotClient:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
+            # 先处理原始相机图像，再追加 task，避免 task 字段被图像 processor 误处理。
+            raw_observation: RawObservation = self.robot_observation_processor(self.robot.get_observation())
             raw_observation["task"] = task
 
             with self.latest_action_lock:
