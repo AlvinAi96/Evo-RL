@@ -84,7 +84,10 @@ def value_train(
     if accelerator is None:
         from accelerate.utils import DistributedDataParallelKwargs
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        # Pistar06 uses only the vision branch of SigLIP. AutoModel still exposes
+        # the unused text-branch parameters, so DDP must discover and skip them
+        # during gradient reduction.
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         force_cpu = cfg.value.device == "cpu"
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
