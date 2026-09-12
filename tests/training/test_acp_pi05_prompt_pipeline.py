@@ -9,7 +9,7 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 from lerobot.rl.acp_hook import build_acp_raw_batch_hook
-from lerobot.rl.acp_tags import ACP_NEGATIVE_TAG, ACP_POSITIVE_TAG
+from lerobot.rl.acp_tags import ACP_POSITIVE_TAG
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 from tests.utils import require_package
 
@@ -101,7 +101,7 @@ def test_acp_prompt_reaches_pi05_tokenizer(mock_auto_tokenizer):
     prompts = tracking_tokenizer.calls[-1]
     assert len(prompts) == 2
     assert ACP_POSITIVE_TAG in prompts[0]
-    assert ACP_NEGATIVE_TAG in prompts[1]
+    assert "Advantage:" not in prompts[1]
     assert prompts[0].startswith("Task: Pick bottle")
     assert "State:" in prompts[0]
     assert OBS_LANGUAGE_TOKENS in out

@@ -23,7 +23,10 @@ cd /scratch/u6pw/ql337.u6pw/projects/Evo-RL
   --log_freq=10 \
   --acp.enable=true \
   --acp.indicator_field=complementary_info.acp_indicator_pistar06_run4_n50_r30 \
-  --acp.indicator_dropout_prob=0.3 \
+  --acp.indicator_dropout_prob=0.1 \
+  --acp.tag_negative_prompts=false \
+  --acp.failure_loss_mode=mask_loss \
+  --acp.success_field=episode_success \
   --output_dir=/scratch/u6pw/ql337.u6pw/projects/Evo-RL/outputs/train/pi05_insert_carrot_hil_acp_bs256_e10 \
   --job_name=pi05_insert_carrot_hil_acp_bs256_e10 \
   --wandb.enable=true \

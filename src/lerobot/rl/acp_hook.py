@@ -48,6 +48,7 @@ class ACPPromptHook:
     def __init__(self, cfg: ACPConfig, seed: int | None):
         self.indicator_field = cfg.indicator_field
         self.dropout = cfg.indicator_dropout_prob
+        self.tag_negative_prompts = cfg.tag_negative_prompts
         self.rng = random.Random(seed if seed is not None else 0)
 
     def _resolve_indicators(self, batch: dict[str, Any], batch_size: int) -> list[bool]:
@@ -71,6 +72,12 @@ class ACPPromptHook:
 
         conditioned_tasks: list[str] = []
         for task, is_positive in zip(tasks, indicators, strict=True):
+            # RLinf 风格默认只给正样本加 Advantage tag，负样本保留 base prompt。
+            if not is_positive and not self.tag_negative_prompts:
+                conditioned_tasks.append(task)
+                continue
+
+            # 正样本按 dropout 保留 base prompt，训练 positive-cond 和 uncond 的差分方向。
             if self.dropout > 0.0 and self.rng.random() < self.dropout:
                 conditioned_tasks.append(task)
                 continue

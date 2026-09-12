@@ -27,6 +27,7 @@ from lerobot.datasets.lerobot_dataset import (
 )
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.datasets.transforms import ImageTransforms
+from lerobot.rl.acp_success_filter import resolve_acp_dataset_episodes
 from lerobot.utils.constants import ACTION, OBS_PREFIX, REWARD
 
 IMAGENET_STATS = {
@@ -89,11 +90,20 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
         delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+        dataset_episodes = cfg.dataset.episodes
+        acp_cfg = getattr(cfg, "acp", None)
+        if acp_cfg is not None:
+            # ACP drop 模式只加载成功 episode；mask_loss 模式不筛，失败样本仍会进入 dataloader。
+            dataset_episodes = resolve_acp_dataset_episodes(
+                requested_episodes=cfg.dataset.episodes,
+                all_episodes=ds_meta.episodes,
+                cfg=acp_cfg,
+            )
         if not cfg.dataset.streaming:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=dataset_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
@@ -104,7 +114,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             dataset = StreamingLeRobotDataset(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
-                episodes=cfg.dataset.episodes,
+                episodes=dataset_episodes,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,

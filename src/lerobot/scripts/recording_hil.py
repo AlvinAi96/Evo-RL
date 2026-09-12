@@ -16,7 +16,8 @@
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
+from contextlib import nullcontext
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,7 @@ import numpy as np
 import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline, RobotAction
 from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.robots import Robot
@@ -36,6 +38,18 @@ class ACPInferenceConfig:
     enable: bool = False
     use_cfg: bool = False
     cfg_beta: float = 1.0
+    velocity_cfg: bool = False
+
+    def validate(self) -> None:
+        """校验 ACP 推理配置组合，避免命令看似生效但实际走错路径。"""
+        if self.use_cfg and not self.enable:
+            raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
+        if self.velocity_cfg and not self.use_cfg:
+            raise ValueError(
+                "`acp_inference.velocity_cfg=true` requires `acp_inference.use_cfg=true`."
+            )
+        if self.cfg_beta < 0:
+            raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
 
 
 POLICY_RUNTIME_STATE_KEYS = ("_action_queue", "_queues", "_prev_mean")
@@ -115,6 +129,67 @@ def _predict_policy_action_with_runtime_state(
     return action
 
 
+def _prepare_policy_observation_batch(
+    *,
+    observation_frame: dict[str, np.ndarray],
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    task: str | None,
+    robot_type: str | None,
+) -> dict[str, Any]:
+    """按指定 task 走完整 preprocessor，得到 policy 可直接消费的 batch。"""
+    observation = copy(observation_frame)
+    observation = prepare_observation_for_inference(observation, device, task, robot_type)
+    return preprocessor(observation)
+
+
+def _predict_policy_action_with_velocity_cfg(
+    *,
+    observation_frame: dict[str, np.ndarray],
+    policy: PreTrainedPolicy,
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    use_amp: bool,
+    task: str | None,
+    conditional_task: str,
+    robot_type: str | None,
+    cfg_beta: float,
+) -> PolicyAction:
+    """在 policy 内部每个 flow-matching velocity step 做 CFG 引导。"""
+    select_action_with_velocity_cfg = getattr(policy, "select_action_with_velocity_cfg", None)
+    if not callable(select_action_with_velocity_cfg):
+        raise NotImplementedError(
+            f"`acp_inference.velocity_cfg=true` is not supported by policy {policy.__class__.__name__}."
+        )
+
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+    ):
+        # 两路 batch 只改变 task 文本：cond 带 positive tag，uncond 保持原始任务。
+        cond_batch = _prepare_policy_observation_batch(
+            observation_frame=observation_frame,
+            device=device,
+            preprocessor=preprocessor,
+            task=conditional_task,
+            robot_type=robot_type,
+        )
+        uncond_batch = _prepare_policy_observation_batch(
+            observation_frame=observation_frame,
+            device=device,
+            preprocessor=preprocessor,
+            task=task,
+            robot_type=robot_type,
+        )
+        action = select_action_with_velocity_cfg(
+            cond_batch,
+            uncond_batch,
+            cfg_beta=cfg_beta,
+        )
+        return postprocessor(action)
+
+
 def _predict_policy_action_with_acp_inference(
     *,
     observation_frame: dict[str, np.ndarray],
@@ -129,6 +204,7 @@ def _predict_policy_action_with_acp_inference(
     cond_runtime_state: dict[str, Any] | None = None,
     uncond_runtime_state: dict[str, Any] | None = None,
 ) -> PolicyAction:
+    acp_inference.validate()
     if not acp_inference.enable:
         return predict_action(
             observation=observation_frame,
@@ -142,6 +218,20 @@ def _predict_policy_action_with_acp_inference(
         )
 
     conditional_task = build_acp_tagged_task(task, is_positive=True)
+    if acp_inference.velocity_cfg and acp_inference.use_cfg:
+        return _predict_policy_action_with_velocity_cfg(
+            observation_frame=observation_frame,
+            policy=policy,
+            device=device,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            use_amp=use_amp,
+            task=task,
+            conditional_task=conditional_task,
+            robot_type=robot_type,
+            cfg_beta=acp_inference.cfg_beta,
+        )
+
     if not acp_inference.use_cfg:
         return predict_action(
             observation=observation_frame,

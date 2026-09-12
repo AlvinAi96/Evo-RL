@@ -282,10 +282,7 @@ class RecordConfig:
 
         if not self.collector_policy_id_human:
             raise ValueError("`collector_policy_id_human` must be a non-empty string.")
-        if self.acp_inference.use_cfg and not self.acp_inference.enable:
-            raise ValueError("`acp_inference.use_cfg=true` requires `acp_inference.enable=true`.")
-        if self.acp_inference.cfg_beta < 0:
-            raise ValueError("`acp_inference.cfg_beta` must be >= 0.")
+        self.acp_inference.validate()
         if self.communication_retry_timeout_s < 0:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:

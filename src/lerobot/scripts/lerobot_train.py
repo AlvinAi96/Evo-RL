@@ -37,6 +37,7 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.acp_dataset_stats import compute_acp_indicator_stats
 from lerobot.rl.acp_hook import build_acp_raw_batch_hook
+from lerobot.rl.acp_success_filter import build_acp_success_loss_weights
 from lerobot.rl.wandb_utils import make_logger
 from lerobot.scripts.lerobot_eval import eval_policy_all
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -66,6 +67,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     rabc_weights_provider=None,
+    acp_success_weights_provider=None,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -83,6 +85,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         rabc_weights_provider: Optional RABCWeights instance for sample weighting.
+        acp_success_weights_provider: Optional ACP success-only loss mask provider.
 
     Returns:
         A tuple containing:
@@ -92,27 +95,43 @@ def update_policy(
     start_time = time.perf_counter()
     policy.train()
 
-    # Get RA-BC weights if enabled
-    rabc_batch_weights = None
-    rabc_batch_stats = None
+    # 按需收集样本权重；ACP success mask 与 RA-BC 权重共同作用于 per-sample loss。
+    sample_weights = None
+    weight_stats = {}
     if rabc_weights_provider is not None:
         rabc_batch_weights, rabc_batch_stats = rabc_weights_provider.compute_batch_weights(batch)
+        sample_weights = rabc_batch_weights
+        weight_stats["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
+        weight_stats["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
+        weight_stats["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+
+    if acp_success_weights_provider is not None:
+        acp_batch_weights, acp_batch_stats = acp_success_weights_provider.compute_batch_weights(batch)
+        sample_weights = (
+            acp_batch_weights if sample_weights is None else sample_weights * acp_batch_weights
+        )
+        weight_stats.update(acp_batch_stats)
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        # Use per-sample loss when RA-BC is enabled for proper weighting
-        if rabc_batch_weights is not None:
+        # 有样本权重时必须取 per-sample loss；失败样本 forward 后权重为 0。
+        if sample_weights is not None:
             # Get per-sample losses
             per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            sample_weights = sample_weights.to(
+                device=per_sample_loss.device,
+                dtype=per_sample_loss.dtype,
+            )
 
-            # Apply RA-BC weights: L_RA-BC = Σ(w_i * l_i) / (Σw_i + ε)
-            # rabc_batch_weights is already normalized to sum to batch_size
+            # Apply sample weights: L = Σ(w_i * l_i) / (Σw_i + ε)
             epsilon = 1e-6
-            loss = (per_sample_loss * rabc_batch_weights).sum() / (rabc_batch_weights.sum() + epsilon)
-            # Log raw mean weight (before normalization) - this is the meaningful metric
-            output_dict["rabc_mean_weight"] = rabc_batch_stats["raw_mean_weight"]
-            output_dict["rabc_num_zero_weight"] = rabc_batch_stats["num_zero_weight"]
-            output_dict["rabc_num_full_weight"] = rabc_batch_stats["num_full_weight"]
+            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
+            # 保留原始均值供排查，同时让日志里的 loss 对齐实际 backward 的加权 loss。
+            if "loss" in output_dict:
+                output_dict["unweighted_loss"] = output_dict["loss"]
+            output_dict.update(weight_stats)
+            output_dict["weighted_loss"] = loss.item()
+            output_dict["loss"] = loss.item()
         else:
             loss, output_dict = policy.forward(batch)
 
@@ -344,6 +363,22 @@ def train(
             device=device,
         )
 
+    acp_success_weights = build_acp_success_loss_weights(dataset=dataset, cfg=cfg.acp, device=device)
+    if is_main_process and acp_success_weights is not None:
+        logging.info(
+            "ACP success-only loss: mode=mask_loss "
+            "success_field='%s' success_episodes=%d selected_episodes=%d",
+            cfg.acp.success_field,
+            len(acp_success_weights.success_episode_indices),
+            dataset.num_episodes,
+        )
+    if is_main_process and cfg.acp.enable and cfg.acp.failure_loss_mode == "drop":
+        logging.info(
+            "ACP success-only loss: mode=drop success_field='%s' selected_episodes=%d",
+            cfg.acp.success_field,
+            dataset.num_episodes,
+        )
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -470,6 +505,7 @@ def train(
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             rabc_weights_provider=rabc_weights,
+            acp_success_weights_provider=acp_success_weights,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we

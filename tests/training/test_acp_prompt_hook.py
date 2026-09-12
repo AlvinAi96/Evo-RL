@@ -16,6 +16,7 @@ def test_acp_hook_accepts_integer_indicators():
             enable=True,
             indicator_field="acp_indicator",
             indicator_dropout_prob=0.0,
+            tag_negative_prompts=True,
         ),
         seed=42,
     )
@@ -37,6 +38,7 @@ def test_acp_hook_injects_tags():
             enable=True,
             indicator_field="complementary_info.acp_indicator",
             indicator_dropout_prob=0.0,
+            tag_negative_prompts=True,
         ),
         seed=42,
     )
@@ -47,6 +49,24 @@ def test_acp_hook_injects_tags():
 
     out = hook(batch, 0)
     assert out["task"] == [f"pick bottle\n{ACP_POSITIVE_TAG}", f"place bottle\n{ACP_NEGATIVE_TAG}"]
+
+
+def test_acp_hook_default_keeps_negative_samples_unconditioned():
+    hook = build_acp_raw_batch_hook(
+        ACPConfig(
+            enable=True,
+            indicator_field="complementary_info.acp_indicator",
+            indicator_dropout_prob=0.0,
+        ),
+        seed=42,
+    )
+    batch = {
+        "task": ["pick bottle", "place bottle"],
+        "complementary_info.acp_indicator": torch.tensor([1, 0], dtype=torch.int64),
+    }
+
+    out = hook(batch, 0)
+    assert out["task"] == [f"pick bottle\n{ACP_POSITIVE_TAG}", "place bottle"]
 
 
 def test_acp_hook_dropout_keeps_original_task():
@@ -135,6 +155,7 @@ def test_acp_hook_with_real_local_dataset_batch(batch_size: int):
             enable=True,
             indicator_field="complementary_info.acp_indicator",
             indicator_dropout_prob=0.0,
+            tag_negative_prompts=True,
         ),
         seed=42,
     )

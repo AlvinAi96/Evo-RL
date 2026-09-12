@@ -174,7 +174,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Policy type: {policy_specs.policy_type} | "
             f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
             f"Actions per chunk: {policy_specs.actions_per_chunk} | "
-            f"Device: {policy_specs.device}"
+            f"Device: {policy_specs.device} | "
+            f"ACP velocity CFG: {getattr(policy_specs, 'acp_velocity_cfg', False)}"
         )
 
         self.device = policy_specs.device
@@ -188,7 +189,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             enable=getattr(policy_specs, "acp_enable", False),
             use_cfg=getattr(policy_specs, "acp_use_cfg", False),
             cfg_beta=getattr(policy_specs, "acp_cfg_beta", 1.0),
+            velocity_cfg=getattr(policy_specs, "acp_velocity_cfg", False),
         )
+        self.acp_inference.validate()
 
         policy_class = get_policy_class(self.policy_type)
 
@@ -234,7 +237,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.cond_policy_runtime_state = None
         self.uncond_policy_runtime_state = None
-        if self.policy is not None and self.acp_inference.enable and self.acp_inference.use_cfg:
+        if (
+            self.policy is not None
+            and self.acp_inference.enable
+            and self.acp_inference.use_cfg
+            and not self.acp_inference.velocity_cfg
+        ):
             self.cond_policy_runtime_state = _capture_policy_runtime_state(self.policy)
             self.uncond_policy_runtime_state = _capture_policy_runtime_state(self.policy)
 
@@ -604,7 +612,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # 后续动作直接从本次 select_action 已经生成好的内部队列里取。
         # 这里保留 select_action 的 processor/ACP 语义，同时按客户端 actions_per_chunk 截断。
-        if self.acp_inference.enable and self.acp_inference.use_cfg:
+        if (
+            self.acp_inference.enable
+            and self.acp_inference.use_cfg
+            and not self.acp_inference.velocity_cfg
+        ):
             remaining = min(
                 self._get_available_buffered_select_actions(self.cond_policy_runtime_state),
                 self._get_available_buffered_select_actions(self.uncond_policy_runtime_state),

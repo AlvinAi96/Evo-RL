@@ -20,9 +20,13 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from lerobot.async_inference.configs import get_aggregate_function
 from lerobot.configs import parser
 from lerobot.scripts.lerobot_human_inloop_record import _HumanInloopFailureResetController
-from lerobot.scripts.lerobot_human_inloop_remote_infer import RemotePolicyActionClient
+from lerobot.scripts.lerobot_human_inloop_remote_infer import (
+    SUPPORTED_REMOTE_INFERENCE_MODES,
+    RemotePolicyActionClient,
+)
 from lerobot.scripts.lerobot_record import RecordConfig, record
 from lerobot.utils.import_utils import register_third_party_plugins
 
@@ -45,6 +49,7 @@ class HumanInloopRemoteRecordConfig(RecordConfig):
     actions_per_chunk: int = 50
     policy_device: str = "cuda"
     client_device: str = "cpu"
+    inference_mode: str = "select_action_buffered"
     chunk_size_threshold: float = 0.5
     aggregate_fn_name: str = "conservative"
     debug_log_queue_size: bool = False
@@ -60,6 +65,13 @@ class HumanInloopRemoteRecordConfig(RecordConfig):
             raise ValueError("`actions_per_chunk` must be positive.")
         if not self.server_address:
             raise ValueError("`server_address` cannot be empty.")
+        if self.inference_mode not in SUPPORTED_REMOTE_INFERENCE_MODES:
+            raise ValueError(
+                f"`inference_mode` must be one of {sorted(SUPPORTED_REMOTE_INFERENCE_MODES)}, "
+                f"got {self.inference_mode!r}."
+            )
+        # 提前校验聚合策略，避免真机连上后才因为拼错参数退出。
+        get_aggregate_function(self.aggregate_fn_name)
 
     @property
     def environment_dt(self) -> float:
@@ -104,7 +116,7 @@ def human_inloop_remote_record(cfg: HumanInloopRemoteRecordConfig):
         "Policy output (when policy is enabled) is stored in `complementary_info.policy_action`. "
         "Collector source is stored in `complementary_info.collector_policy_id`. "
         "Remote policy server: %s | policy_type=%s | policy=%s. "
-        "ACP inference: enable=%s use_cfg=%s cfg_beta=%.3f.",
+        "ACP inference: enable=%s use_cfg=%s velocity_cfg=%s cfg_beta=%.3f.",
         cfg.intervention_toggle_key,
         cfg.episode_success_key,
         cfg.episode_failure_key,
@@ -113,6 +125,7 @@ def human_inloop_remote_record(cfg: HumanInloopRemoteRecordConfig):
         cfg.pretrained_name_or_path,
         cfg.acp_inference.enable,
         cfg.acp_inference.use_cfg,
+        cfg.acp_inference.velocity_cfg,
         cfg.acp_inference.cfg_beta,
     )
     return record(cfg)

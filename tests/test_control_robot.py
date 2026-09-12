@@ -505,6 +505,29 @@ def test_record_config_rejects_negative_cfg_beta():
         )
 
 
+def test_record_config_rejects_velocity_cfg_without_cfg():
+    """校验 velocity CFG 必须显式开启 CFG，避免误以为单路 positive prompt 已经在引导。"""
+    robot_cfg = MockRobotConfig()
+    teleop_cfg = MockTeleopConfig()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        num_episodes=1,
+        episode_time_s=0.1,
+        reset_time_s=0,
+        push_to_hub=False,
+    )
+
+    with pytest.raises(ValueError, match="acp_inference.velocity_cfg=true"):
+        RecordConfig(
+            robot=robot_cfg,
+            dataset=dataset_cfg,
+            teleop=teleop_cfg,
+            play_sounds=False,
+            acp_inference=ACPInferenceConfig(enable=True, use_cfg=False, velocity_cfg=True),
+        )
+
+
 def test_acp_inference_without_cfg_appends_positive_prompt():
     class _StaticPolicy:
         def __init__(self, value: float):
@@ -568,6 +591,74 @@ def test_acp_inference_with_cfg_blends_cond_and_uncond_actions():
         "Pick and place\nAdvantage: positive",
         "Pick and place",
     ]
+
+
+def test_acp_inference_with_velocity_cfg_calls_policy_guided_sampler():
+    """确认 velocity CFG 走 policy 的逐步引导入口，而不是旧的 action-level select_action。"""
+    class _VelocityPolicy:
+        def __init__(self):
+            """记录 helper 传入的 cond/uncond task，便于断言 CFG 分支。"""
+            self.calls = []
+
+        def select_action(self, batch):
+            """旧 action-level 入口不应该在 velocity CFG 模式下被调用。"""
+            raise AssertionError("velocity CFG should not call action-level select_action")
+
+        def select_action_with_velocity_cfg(self, cond_batch, uncond_batch, cfg_beta):
+            """模拟 policy 内部的 velocity CFG 采样结果。"""
+            self.calls.append((cond_batch["task"], uncond_batch["task"], cfg_beta))
+            return torch.tensor([[4.0, 4.0, 4.0]], dtype=torch.float32)
+
+    observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
+    policy = _VelocityPolicy()
+
+    action = _predict_policy_action_with_acp_inference(
+        observation_frame=observation_frame,
+        policy=policy,
+        device=torch.device("cpu"),
+        preprocessor=lambda x: x,
+        postprocessor=lambda x: x + 1.0,
+        use_amp=False,
+        task="Pick and place",
+        robot_type="mock_robot",
+        acp_inference=ACPInferenceConfig(
+            enable=True,
+            use_cfg=True,
+            cfg_beta=0.7,
+            velocity_cfg=True,
+        ),
+    )
+
+    assert torch.allclose(action, torch.tensor([[5.0, 5.0, 5.0]], dtype=torch.float32))
+    assert policy.calls == [("Pick and place\nAdvantage: positive", "Pick and place", 0.7)]
+
+
+def test_acp_inference_velocity_cfg_requires_policy_support():
+    """不支持 velocity CFG 的 policy 应该显式报错，避免静默退回旧逻辑。"""
+    class _StaticPolicy:
+        def select_action(self, batch):
+            """普通 policy 只提供旧 select_action 接口。"""
+            return torch.tensor([[1.0, 1.0, 1.0]], dtype=torch.float32)
+
+    observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
+
+    with pytest.raises(NotImplementedError, match="velocity_cfg=true"):
+        _predict_policy_action_with_acp_inference(
+            observation_frame=observation_frame,
+            policy=_StaticPolicy(),
+            device=torch.device("cpu"),
+            preprocessor=lambda x: x,
+            postprocessor=lambda x: x,
+            use_amp=False,
+            task="Pick and place",
+            robot_type="mock_robot",
+            acp_inference=ACPInferenceConfig(
+                enable=True,
+                use_cfg=True,
+                cfg_beta=1.0,
+                velocity_cfg=True,
+            ),
+        )
 
 
 def test_acp_inference_with_cfg_uses_isolated_branch_queues():

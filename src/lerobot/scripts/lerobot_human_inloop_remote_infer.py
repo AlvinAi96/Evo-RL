@@ -159,6 +159,7 @@ class HumanInloopRemoteInferConfig:
             raise ValueError("`communication_retry_timeout_s` must be >= 0.")
         if self.communication_retry_interval_s <= 0:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
+        self.acp_inference.validate()
 
     @property
     def environment_dt(self) -> float:
@@ -189,6 +190,7 @@ class RemotePolicyActionClient:
             acp_enable=cfg.acp_inference.enable,
             acp_use_cfg=cfg.acp_inference.use_cfg,
             acp_cfg_beta=cfg.acp_inference.cfg_beta,
+            acp_velocity_cfg=cfg.acp_inference.velocity_cfg,
         )
         self.channel = grpc.insecure_channel(
             cfg.server_address, grpc_channel_options(initial_backoff=f"{cfg.environment_dt:.4f}s")
@@ -535,10 +537,12 @@ def _remote_human_inloop_loop(
     last_teleop_action: RobotAction | None = None
     task = _build_remote_task(cfg.task, cfg.acp_inference)
     logging.info(
-        "Remote inference task text:\n%s\nACP inference: enable=%s use_cfg=%s cfg_beta=%s",
+        "Remote inference task text:\n%s\nACP inference: enable=%s use_cfg=%s "
+        "velocity_cfg=%s cfg_beta=%s",
         task,
         cfg.acp_inference.enable,
         cfg.acp_inference.use_cfg,
+        cfg.acp_inference.velocity_cfg,
         cfg.acp_inference.cfg_beta,
     )
     start_t = time.perf_counter()
