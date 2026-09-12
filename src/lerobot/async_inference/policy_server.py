@@ -25,6 +25,7 @@ python -m lerobot.async_inference.policy_server \
 """
 
 import logging
+import inspect
 import pickle  # nosec
 import threading
 import time
@@ -46,8 +47,10 @@ from lerobot.processor import (
     PolicyProcessorPipeline,
 )
 from lerobot.processor.rename_processor import RenameObservationsProcessorStep
+from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.scripts.recording_hil import (
     ACPInferenceConfig,
+    _build_positive_language_batch_from_base,
     _capture_policy_runtime_state,
     _predict_policy_action_with_acp_inference,
 )
@@ -475,9 +478,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
-    def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+    def _get_action_chunk(
+        self,
+        observation: dict[str, torch.Tensor],
+        cfg_positive_observation: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """从 policy 取 action chunk；velocity CFG 时额外透传 positive batch。"""
+        kwargs: dict[str, Any] = {}
+        if cfg_positive_observation is not None:
+            predict_action_chunk = getattr(self.policy, "predict_action_chunk", None)
+            if not callable(predict_action_chunk) or "cfg_positive_batch" not in inspect.signature(
+                predict_action_chunk
+            ).parameters:
+                raise NotImplementedError(
+                    f"`acp_inference.velocity_cfg=true` is not supported by policy {self.policy.__class__.__name__}."
+                )
+            # positive batch 只提供语言 tokens/masks；Pi0.5 内部会在归一化动作空间做 velocity CFG。
+            kwargs["cfg_positive_batch"] = cfg_positive_observation
+            kwargs["cfg_beta"] = self.acp_inference.cfg_beta
+
+        chunk = self.policy.predict_action_chunk(observation, **kwargs)
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -679,8 +699,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        raw_observation = dict(observation_t.get_observation())
+        positive_raw_observation = None
+        if self.acp_inference.enable and self.acp_inference.use_cfg and self.acp_inference.velocity_cfg:
+            task = raw_observation.get("task", "")
+            positive_raw_observation = dict(raw_observation)
+            positive_raw_observation["task"] = build_acp_tagged_task(task, is_positive=True)
+
         observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
+            raw_observation,
             self.lerobot_features,
             self.policy_image_features,
             rename_map=self.rename_map,
@@ -690,12 +717,31 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
         observation = self.preprocessor(observation)
+        cfg_positive_observation = None
+        if positive_raw_observation is not None:
+            # 尽量复用 base batch 的归一化 state，避免重复推进有状态 preprocessor。
+            cfg_positive_observation = _build_positive_language_batch_from_base(
+                base_batch=observation,
+                preprocessor=self.preprocessor,
+                positive_task=positive_raw_observation["task"],
+            )
+            if cfg_positive_observation is None:
+                cfg_positive_observation = raw_observation_to_observation(
+                    positive_raw_observation,
+                    self.lerobot_features,
+                    self.policy_image_features,
+                    rename_map=self.rename_map,
+                )
+                cfg_positive_observation = self.preprocessor(cfg_positive_observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        action_tensor = self._get_action_chunk(
+            observation,
+            cfg_positive_observation=cfg_positive_observation,
+        )
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"

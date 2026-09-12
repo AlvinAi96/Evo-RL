@@ -594,19 +594,15 @@ def test_acp_inference_with_cfg_blends_cond_and_uncond_actions():
 
 
 def test_acp_inference_with_velocity_cfg_calls_policy_guided_sampler():
-    """确认 velocity CFG 走 policy 的逐步引导入口，而不是旧的 action-level select_action。"""
+    """确认 velocity CFG 通过普通 select_action 把 positive batch 传入 policy。"""
     class _VelocityPolicy:
         def __init__(self):
-            """记录 helper 传入的 cond/uncond task，便于断言 CFG 分支。"""
+            """记录 helper 传入的 base/positive task，便于断言 CFG 分支。"""
             self.calls = []
 
-        def select_action(self, batch):
-            """旧 action-level 入口不应该在 velocity CFG 模式下被调用。"""
-            raise AssertionError("velocity CFG should not call action-level select_action")
-
-        def select_action_with_velocity_cfg(self, cond_batch, uncond_batch, cfg_beta):
-            """模拟 policy 内部的 velocity CFG 采样结果。"""
-            self.calls.append((cond_batch["task"], uncond_batch["task"], cfg_beta))
+        def select_action(self, batch, cfg_positive_batch=None, cfg_beta=1.0):
+            """模拟 policy 内部接收 base/positive batch 后的 velocity CFG 采样结果。"""
+            self.calls.append((batch["task"], cfg_positive_batch["task"], cfg_beta))
             return torch.tensor([[4.0, 4.0, 4.0]], dtype=torch.float32)
 
     observation_frame = {"observation.state": np.array([0.0, 0.0, 0.0], dtype=np.float32)}
@@ -630,7 +626,7 @@ def test_acp_inference_with_velocity_cfg_calls_policy_guided_sampler():
     )
 
     assert torch.allclose(action, torch.tensor([[5.0, 5.0, 5.0]], dtype=torch.float32))
-    assert policy.calls == [("Pick and place\nAdvantage: positive", "Pick and place", 0.7)]
+    assert policy.calls == [("Pick and place", "Pick and place\nAdvantage: positive", 0.7)]
 
 
 def test_acp_inference_velocity_cfg_requires_policy_support():

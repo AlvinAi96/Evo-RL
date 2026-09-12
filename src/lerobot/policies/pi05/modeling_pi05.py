@@ -783,16 +783,29 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         img_masks,
         tokens,
         masks,
+        cfg_positive_tokens=None,
+        cfg_positive_masks=None,
+        cfg_beta: float = 1.0,
         noise=None,
         num_steps=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action."""
+        """执行 Pi0.5 推理；传入 positive tokens 时在 denoise loop 内做 velocity CFG。"""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
         bsize = tokens.shape[0]
         device = tokens.device
+        use_velocity_cfg = cfg_positive_tokens is not None or cfg_positive_masks is not None
+        if use_velocity_cfg:
+            if self._rtc_enabled():
+                raise NotImplementedError("Velocity CFG is not supported together with RTC.")
+            if cfg_positive_tokens is None or cfg_positive_masks is None:
+                raise ValueError("Velocity CFG requires both cfg_positive_tokens and cfg_positive_masks.")
+            if cfg_positive_tokens.shape[0] != bsize:
+                raise ValueError("Base and positive CFG batches must have the same batch size.")
+            if cfg_beta < 0:
+                raise ValueError("cfg_beta must be >= 0.")
 
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
@@ -803,23 +816,31 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        def cache_prefix(current_tokens, current_masks):
+            """缓存一条 prompt prefix，denoise loop 里只复用 KV cache。"""
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, current_tokens, current_masks
+            )
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+            return prefix_pad_masks, past_key_values
 
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        # base prefix 是 uncond 分支；positive prefix 只在 velocity CFG 打开时额外缓存。
+        prefix_pad_masks, past_key_values = cache_prefix(tokens, masks)
+        cfg_positive_cache = (
+            cache_prefix(cfg_positive_tokens, cfg_positive_masks) if use_velocity_cfg else None
         )
 
         dt = -1.0 / num_steps
-
         x_t = noise
         for step in range(num_steps):
             time = 1.0 + step * dt
@@ -833,7 +854,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if use_velocity_cfg:
+                if cfg_positive_cache is None:
+                    raise RuntimeError("Positive CFG cache is unexpectedly missing.")
+                positive_prefix_pad_masks, positive_past_key_values = cfg_positive_cache
+
+                # CFG 在归一化动作空间、postprocessor 之前完成；两路共享同一个 x_t。
+                v_uncond = denoise_step_partial_call(x_t)
+                v_cond = self.denoise_step(
+                    prefix_pad_masks=positive_prefix_pad_masks,
+                    past_key_values=positive_past_key_values,
+                    x_t=x_t,
+                    timestep=time_tensor,
+                )
+                v_t = v_uncond + cfg_beta * (v_cond - v_uncond)
+            elif self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
@@ -849,94 +884,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else:
                 v_t = denoise_step_partial_call(x_t)
 
-            x_t = x_t + dt * v_t
-
-            if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
-        return x_t
-
-    @torch.no_grad()
-    def sample_actions_with_velocity_cfg(
-        self,
-        images,
-        img_masks,
-        cond_tokens,
-        cond_masks,
-        uncond_tokens,
-        uncond_masks,
-        cfg_beta: float,
-        noise=None,
-        num_steps=None,
-        **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """使用同一份噪声，在每个 flow-matching velocity step 做 CFG 引导。"""
-        if self._rtc_enabled():
-            raise NotImplementedError("Velocity CFG is not supported together with RTC.")
-        if num_steps is None:
-            num_steps = self.config.num_inference_steps
-
-        bsize = cond_tokens.shape[0]
-        if uncond_tokens.shape[0] != bsize:
-            raise ValueError("Conditional and unconditional batches must have the same batch size.")
-        device = cond_tokens.device
-
-        if noise is None:
-            # cond/uncond 两路共享同一份初始噪声，确保 CFG 差分只来自 prompt 条件。
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        cond_prefix_embs, cond_prefix_pad_masks, cond_prefix_att_masks = self.embed_prefix(
-            images, img_masks, cond_tokens, cond_masks
-        )
-        uncond_prefix_embs, uncond_prefix_pad_masks, uncond_prefix_att_masks = self.embed_prefix(
-            images, img_masks, uncond_tokens, uncond_masks
-        )
-
-        cond_prefix_att_2d_masks = make_att_2d_masks(cond_prefix_pad_masks, cond_prefix_att_masks)
-        uncond_prefix_att_2d_masks = make_att_2d_masks(uncond_prefix_pad_masks, uncond_prefix_att_masks)
-        cond_prefix_position_ids = torch.cumsum(cond_prefix_pad_masks, dim=1) - 1
-        uncond_prefix_position_ids = torch.cumsum(uncond_prefix_pad_masks, dim=1) - 1
-
-        cond_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(cond_prefix_att_2d_masks)
-        uncond_prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(uncond_prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, cond_past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=cond_prefix_att_2d_masks_4d,
-            position_ids=cond_prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[cond_prefix_embs, None],
-            use_cache=True,
-        )
-        _, uncond_past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=uncond_prefix_att_2d_masks_4d,
-            position_ids=uncond_prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[uncond_prefix_embs, None],
-            use_cache=True,
-        )
-
-        dt = -1.0 / num_steps
-        x_t = noise
-        for step in range(num_steps):
-            time = 1.0 + step * dt
-            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
-
-            # 每一步都在当前 x_t 上分别预测 cond/uncond velocity，再合成 guided velocity。
-            cond_v_t = self.denoise_step(
-                prefix_pad_masks=cond_prefix_pad_masks,
-                past_key_values=cond_past_key_values,
-                x_t=x_t,
-                timestep=time_tensor,
-            )
-            uncond_v_t = self.denoise_step(
-                prefix_pad_masks=uncond_prefix_pad_masks,
-                past_key_values=uncond_past_key_values,
-                x_t=x_t,
-                timestep=time_tensor,
-            )
-            v_t = uncond_v_t + cfg_beta * (cond_v_t - uncond_v_t)
             x_t = x_t + dt * v_t
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
@@ -1295,8 +1242,13 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
-    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations."""
+    def select_action(
+        self,
+        batch: dict[str, Tensor],
+        cfg_positive_batch: dict[str, Tensor] | None = None,
+        cfg_beta: float = 1.0,
+    ) -> Tensor:
+        """选择单步 action；velocity CFG 时队列缓存 guided raw action。"""
         assert not self._rtc_enabled(), (
             "RTC is not supported for select_action, use it with predict_action_chunk"
         )
@@ -1305,78 +1257,46 @@ class PI05Policy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            # velocity CFG 打开时，队列里缓存的是 postprocessor 前的 guided action chunk。
+            actions = self.predict_action_chunk(
+                batch,
+                cfg_positive_batch=cfg_positive_batch,
+                cfg_beta=cfg_beta,
+            )[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def select_action_with_velocity_cfg(
+    def predict_action_chunk(
         self,
-        cond_batch: dict[str, Tensor],
-        uncond_batch: dict[str, Tensor],
-        cfg_beta: float,
+        batch: dict[str, Tensor],
+        cfg_positive_batch: dict[str, Tensor] | None = None,
+        cfg_beta: float = 1.0,
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """选择单步 action；当队列为空时，用 velocity CFG 生成一整段 guided action。"""
-        assert not self._rtc_enabled(), (
-            "RTC is not supported for select_action_with_velocity_cfg, use non-RTC inference"
-        )
-
-        self.eval()
-        if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk_with_velocity_cfg(
-                cond_batch,
-                uncond_batch,
-                cfg_beta=cfg_beta,
-            )[:, : self.config.n_action_steps]
-            # 队列里只保存已经按 velocity CFG 引导后的动作，后续 pop 不再重复算两路。
-            self._action_queue.extend(actions.transpose(0, 1))
-
-        return self._action_queue.popleft()
-
-    @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
-        """Predict a chunk of actions given environment observations."""
+        """预测 action chunk；positive batch 只用于提供 velocity CFG 语言条件。"""
         self.eval()
 
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        cfg_positive_tokens = None
+        cfg_positive_masks = None
+        if cfg_positive_batch is not None:
+            # 只从 positive batch 取语言 tokens；图像/状态仍复用 base batch，避免两路观测不一致。
+            cfg_positive_tokens = cfg_positive_batch[f"{OBS_LANGUAGE_TOKENS}"]
+            cfg_positive_masks = cfg_positive_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
-
-        # Unpad actions to actual action dimension
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
-
-        return actions
-
-    @torch.no_grad()
-    def predict_action_chunk_with_velocity_cfg(
-        self,
-        cond_batch: dict[str, Tensor],
-        uncond_batch: dict[str, Tensor],
-        cfg_beta: float,
-        **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        """预测 action chunk，并在 Pi0.5 流匹配采样循环内执行 velocity CFG。"""
-        self.eval()
-
-        images, img_masks = self._preprocess_images(cond_batch)
-        cond_tokens = cond_batch[f"{OBS_LANGUAGE_TOKENS}"]
-        cond_masks = cond_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        uncond_tokens = uncond_batch[f"{OBS_LANGUAGE_TOKENS}"]
-        uncond_masks = uncond_batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-
-        actions = self.model.sample_actions_with_velocity_cfg(
+        actions = self.model.sample_actions(
             images,
             img_masks,
-            cond_tokens,
-            cond_masks,
-            uncond_tokens,
-            uncond_masks,
+            tokens,
+            masks,
+            cfg_positive_tokens=cfg_positive_tokens,
+            cfg_positive_masks=cfg_positive_masks,
             cfg_beta=cfg_beta,
             **kwargs,
         )

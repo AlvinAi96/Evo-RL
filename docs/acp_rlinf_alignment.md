@@ -102,6 +102,16 @@ x_t = x_t + dt * v
 
 `velocity_cfg=true` 当前只支持 Pi0.5；其它 policy 没有对应 flow-matching velocity 接口时会直接报错。
 
+实现边界：
+
+- Pi0.5 的 `sample_actions()` 接收可选 `cfg_positive_tokens/cfg_positive_masks/cfg_beta`。
+- `tokens/masks` 是 base task；`cfg_positive_tokens/cfg_positive_masks` 是 `Task + Advantage: positive`。
+- 进入 denoise loop 前会分别缓存 base prefix 和 positive prefix。
+- 每一步都在同一个 `x_t` 上算 `v_uncond` 与 `v_cond`，再合成 `v_t`。
+- CFG 在 policy 内部的归一化动作空间完成，且发生在 postprocessor/反归一化/相对动作还原之前。
+- `select_action` 队列里缓存的是已经 velocity-guided 的 raw action；`select_action_buffered_async` 后续从同一个 guided queue 取动作，不再对 cond/uncond 两条 postprocessed action 做相减。
+- RTC 当前不和 velocity CFG 同时启用；如果 Pi0.5 配置开启 RTC，再打开 `velocity_cfg=true` 会显式报错。
+
 ## 端到端命令流程
 
 下面命令按当前分支的新 ACP 训练逻辑整理，覆盖：

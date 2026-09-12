@@ -14,6 +14,7 @@
 
 """Human-in-loop recording helpers used by `lerobot_record.py`."""
 
+import inspect
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -27,9 +28,11 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline, RobotAction
+from lerobot.processor.core import TransitionKey
 from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.robots import Robot
 from lerobot.teleoperators import Teleoperator
+from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.control_utils import predict_action
 
 
@@ -143,6 +146,44 @@ def _prepare_policy_observation_batch(
     return preprocessor(observation)
 
 
+def _find_preprocessor_step(
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    class_name: str,
+) -> Any | None:
+    """按类名查找 processor step，避免 recording_hil 强依赖某个 policy 模块。"""
+    for step in getattr(preprocessor, "steps", []):
+        if step.__class__.__name__ == class_name:
+            return step
+    return None
+
+
+def _build_positive_language_batch_from_base(
+    *,
+    base_batch: dict[str, Any],
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    positive_task: str,
+) -> dict[str, Any] | None:
+    """复用 base batch 的归一化 state，只重新生成 positive prompt 的 tokens/masks。"""
+    prompt_step = _find_preprocessor_step(preprocessor, "Pi05PrepareStateTokenizerProcessorStep")
+    tokenizer_step = _find_preprocessor_step(preprocessor, "TokenizerProcessorStep")
+    if prompt_step is None or tokenizer_step is None or OBS_STATE not in base_batch:
+        return None
+
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: base_batch[OBS_STATE]},
+        TransitionKey.COMPLEMENTARY_DATA: {"task": [positive_task]},
+    }
+    # 先用 Pi0.5 的 state prompt 规则拼出完整文本，再只跑 tokenizer step。
+    transition = prompt_step(transition)
+    transition = tokenizer_step(transition)
+    positive_observation = transition[TransitionKey.OBSERVATION]
+
+    positive_batch = dict(base_batch)
+    positive_batch[OBS_LANGUAGE_TOKENS] = positive_observation[OBS_LANGUAGE_TOKENS]
+    positive_batch[OBS_LANGUAGE_ATTENTION_MASK] = positive_observation[OBS_LANGUAGE_ATTENTION_MASK]
+    return positive_batch
+
+
 def _predict_policy_action_with_velocity_cfg(
     *,
     observation_frame: dict[str, np.ndarray],
@@ -157,8 +198,8 @@ def _predict_policy_action_with_velocity_cfg(
     cfg_beta: float,
 ) -> PolicyAction:
     """在 policy 内部每个 flow-matching velocity step 做 CFG 引导。"""
-    select_action_with_velocity_cfg = getattr(policy, "select_action_with_velocity_cfg", None)
-    if not callable(select_action_with_velocity_cfg):
+    select_action = getattr(policy, "select_action", None)
+    if not callable(select_action) or "cfg_positive_batch" not in inspect.signature(select_action).parameters:
         raise NotImplementedError(
             f"`acp_inference.velocity_cfg=true` is not supported by policy {policy.__class__.__name__}."
         )
@@ -167,24 +208,30 @@ def _predict_policy_action_with_velocity_cfg(
         torch.inference_mode(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
-        # 两路 batch 只改变 task 文本：cond 带 positive tag，uncond 保持原始任务。
-        cond_batch = _prepare_policy_observation_batch(
-            observation_frame=observation_frame,
-            device=device,
-            preprocessor=preprocessor,
-            task=conditional_task,
-            robot_type=robot_type,
-        )
-        uncond_batch = _prepare_policy_observation_batch(
+        # base batch 保持原始 task，positive batch 只替换语言条件；CFG 在 policy 内、postprocessor 前完成。
+        base_batch = _prepare_policy_observation_batch(
             observation_frame=observation_frame,
             device=device,
             preprocessor=preprocessor,
             task=task,
             robot_type=robot_type,
         )
-        action = select_action_with_velocity_cfg(
-            cond_batch,
-            uncond_batch,
+        positive_batch = _build_positive_language_batch_from_base(
+            base_batch=base_batch,
+            preprocessor=preprocessor,
+            positive_task=conditional_task,
+        )
+        if positive_batch is None:
+            positive_batch = _prepare_policy_observation_batch(
+                observation_frame=observation_frame,
+                device=device,
+                preprocessor=preprocessor,
+                task=conditional_task,
+                robot_type=robot_type,
+            )
+        action = select_action(
+            base_batch,
+            cfg_positive_batch=positive_batch,
             cfg_beta=cfg_beta,
         )
         return postprocessor(action)
