@@ -26,6 +26,33 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 DEFAULT_IMAGE_SIZE = 224
 
 
+@dataclass
+class PI05DepthAlignVisualizationConfig:
+    """Depth 蒸馏可视化配置；只在训练期开启，不影响推理输入输出。"""
+
+    enable: bool = False
+    output_dir: str = "outputs/depth_align_viz"
+    interval_steps: int = 500
+    max_items: int = 4
+
+
+@dataclass
+class PI05DepthAlignConfig:
+    """Pi0.5 的 LingBot-Depth 蒸馏配置；默认关闭，保持现有训练/推理逻辑。"""
+
+    enable: bool = False
+    moge_path: str | None = None
+    lingbot_depth_path: str | None = None
+    loss_weight: float = 0.004
+    target_token_size: int = 16
+    target_dim: int = 1024
+    target_num_tokens: int = 256
+    resolution_level: int = 3
+    visualize: PI05DepthAlignVisualizationConfig = field(
+        default_factory=PI05DepthAlignVisualizationConfig
+    )
+
+
 @PreTrainedConfig.register_subclass("pi05")
 @dataclass
 class PI05Config(PreTrainedConfig):
@@ -86,6 +113,7 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    depth_align: PI05DepthAlignConfig = field(default_factory=PI05DepthAlignConfig)
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -120,6 +148,19 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.depth_align.enable:
+            if self.depth_align.loss_weight < 0:
+                raise ValueError("depth_align.loss_weight must be >= 0.")
+            if self.depth_align.target_token_size <= 0:
+                raise ValueError("depth_align.target_token_size must be > 0.")
+            if self.depth_align.target_dim <= 0:
+                raise ValueError("depth_align.target_dim must be > 0.")
+            if self.depth_align.target_num_tokens <= 0:
+                raise ValueError("depth_align.target_num_tokens must be > 0.")
+            if self.depth_align.visualize.interval_steps <= 0:
+                raise ValueError("depth_align.visualize.interval_steps must be > 0.")
+            if self.depth_align.visualize.max_items <= 0:
+                raise ValueError("depth_align.visualize.max_items must be > 0.")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

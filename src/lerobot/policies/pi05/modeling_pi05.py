@@ -41,6 +41,13 @@ else:
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.pi05.depth_align import (
+    PI05_DEPTH_TARGETS_KEY,
+    PI05DepthTargetGenerator,
+    compute_depth_alignment_loss,
+    make_depth_align_head,
+    save_depth_alignment_visualization,
+)
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
@@ -562,6 +569,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.depth_align_head = None
+        if config.depth_align.enable:
+            # depth head 只在训练 forward 中产生辅助监督，推理仍然只输出 action。
+            self.depth_align_head = make_depth_align_head(
+                hidden_dim=paligemma_config.width,
+                target_dim=config.depth_align.target_dim,
+            )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -632,12 +646,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, images, img_masks, tokens, masks, return_image_token_counts: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, list[int]
+    ]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
         pad_masks = []
         att_masks = []
+        image_token_counts = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -647,6 +664,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
+            image_token_counts.append(num_img_embs)
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
@@ -672,6 +690,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
+        if return_image_token_counts:
+            return embs, pad_masks, att_masks, image_token_counts
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions, timestep):
@@ -721,7 +741,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise=None,
+        time=None,
+        depth_targets: Tensor | None = None,
+    ) -> Tensor | tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -733,7 +763,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_counts = self.embed_prefix(
+            images, img_masks, tokens, masks, return_image_token_counts=True
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
@@ -752,7 +784,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -760,9 +792,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -774,7 +806,26 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        action_losses = F.mse_loss(u_t, v_t, reduction="none")
+        if depth_targets is None:
+            return action_losses
+        if self.depth_align_head is None:
+            raise RuntimeError("depth_targets were provided but depth_align_head is not initialized.")
+
+        # 用 VLM prefix 的图像 token 对齐 LingBot-Depth feature，作为辅助训练信号。
+        depth_loss, depth_preds = compute_depth_alignment_loss(
+            prefix_hidden_states=prefix_out,
+            image_token_counts=image_token_counts,
+            img_masks=img_masks,
+            depth_targets=depth_targets,
+            depth_align_head=self.depth_align_head,
+            config=self.config.depth_align,
+        )
+        return action_losses, {
+            "depth_loss": depth_loss,
+            "depth_loss_weighted": depth_loss * self.config.depth_align.loss_weight,
+            "depth_preds": depth_preds,
+        }
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -958,6 +1009,8 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+        self._depth_target_generator = None
+        self._depth_viz_step = 0
 
         self.reset()
 
@@ -1051,8 +1104,20 @@ class PI05Policy(PreTrainedPolicy):
 
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # 旧 Pi0.5 checkpoint 没有 depth head；
+            # 开启 depth_align 微调时只放过这些新增参数。
+            load_strict = strict and not model.config.depth_align.enable
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=load_strict)
+            if strict and model.config.depth_align.enable:
+                allowed_missing = [
+                    key for key in missing_keys if key.startswith("model.depth_align_head.")
+                ]
+                disallowed_missing = sorted(set(missing_keys) - set(allowed_missing))
+                if disallowed_missing or unexpected_keys:
+                    raise RuntimeError(
+                        "Failed to load PI05 checkpoint with depth_align enabled. "
+                        f"missing={disallowed_missing}, unexpected={unexpected_keys}"
+                    )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1306,6 +1371,60 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+    def _get_depth_target_generator(self) -> PI05DepthTargetGenerator:
+        """按当前训练 device 懒加载冻结 teacher，避免推理启动时强依赖 depth 包。"""
+        device = next(self.parameters()).device
+        generator = self._depth_target_generator
+        if generator is None or generator.device != device:
+            generator = PI05DepthTargetGenerator(self.config.depth_align, device=device)
+            self._depth_target_generator = generator
+        return generator
+
+    def _get_depth_targets(self, images: list[Tensor], batch: dict[str, Tensor]) -> Tensor:
+        """优先使用预计算 target；没有时用 MoGe + LingBot-Depth 在线生成。"""
+        if PI05_DEPTH_TARGETS_KEY in batch:
+            return batch[PI05_DEPTH_TARGETS_KEY].to(device=images[0].device)
+        generator = self._get_depth_target_generator()
+        return generator(images).to(device=images[0].device)
+
+    def _current_distributed_rank(self) -> int:
+        """获取分布式 rank；未初始化分布式时视为主进程。"""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    def _maybe_save_depth_visualization(
+        self,
+        images: list[Tensor],
+        img_masks: list[Tensor],
+        depth_targets: Tensor | None,
+        depth_aux: dict[str, Tensor],
+        loss_dict: dict,
+    ) -> None:
+        """按开关和步频保存 depth 对齐可视化，便于初期人工确认。"""
+        viz_cfg = self.config.depth_align.visualize
+        if not self.config.depth_align.enable or not viz_cfg.enable or depth_targets is None:
+            return
+        if self._current_distributed_rank() != 0:
+            return
+
+        self._depth_viz_step += 1
+        if self._depth_viz_step % viz_cfg.interval_steps != 0:
+            return
+
+        written = save_depth_alignment_visualization(
+            images=images,
+            depth_preds=depth_aux["depth_preds"],
+            depth_targets=depth_targets,
+            img_masks=img_masks,
+            output_dir=viz_cfg.output_dir,
+            step=self._depth_viz_step,
+            max_items=viz_cfg.max_items,
+            token_size=self.config.depth_align.target_token_size,
+        )
+        if written:
+            loss_dict["depth_viz_paths"] = [str(path) for path in written]
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1320,26 +1439,51 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        depth_targets = self._get_depth_targets(images, batch) if self.config.depth_align.enable else None
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        model_output = self.model.forward(
+            images, img_masks, tokens, masks, actions, depth_targets=depth_targets
+        )
+        depth_aux = None
+        if isinstance(model_output, tuple):
+            losses, depth_aux = model_output
+        else:
+            losses = model_output
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+        depth_loss_weighted = depth_aux["depth_loss_weighted"] if depth_aux is not None else None
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
+        if depth_aux is not None:
+            loss_dict["action_loss"] = losses.mean().item()
+            loss_dict["depth_loss"] = depth_aux["depth_loss"].detach().item()
+            loss_dict["depth_loss_weighted"] = depth_loss_weighted.detach().item()
+            self._maybe_save_depth_visualization(
+                images=images,
+                img_masks=img_masks,
+                depth_targets=depth_targets,
+                depth_aux=depth_aux,
+                loss_dict=loss_dict,
+            )
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
+            if depth_loss_weighted is not None:
+                # 样本权重分支要求返回 [B]，这里把 depth loss 均匀加到每个样本上。
+                per_sample_loss = per_sample_loss + depth_loss_weighted
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
             loss = losses.mean()
+            if depth_loss_weighted is not None:
+                loss = loss + depth_loss_weighted
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -1349,7 +1493,8 @@ class PI05Policy(PreTrainedPolicy):
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
         )
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
+        modules_to_save = ["model.depth_align_head"] if self.config.depth_align.enable else []
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
