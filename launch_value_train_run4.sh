@@ -16,11 +16,11 @@ exec .venv/bin/accelerate launch \
   --value.use_gradient_checkpointing=true \
   --batch_size=64 \
   --num_workers=8 \
-  --steps=8000 \
-  --save_freq=2000 \
+  --steps=2000 \
+  --save_freq=500 \
   --log_freq=25 \
   --value.scheduler_warmup_steps=500 \
-  --value.scheduler_decay_steps=8000 \
+  --value.scheduler_decay_steps=2000 \
   --output_dir="$VALUE_OUTPUT_R1" \
   --job_name=pistar06_insert_carrot_v2_r1 \
   --value.push_to_hub=false \
