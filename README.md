@@ -10,7 +10,6 @@
 - [`src/lerobot/processor/relative_action_processor.py`](src/lerobot/processor/relative_action_processor.py)：注册 `relative_actions_processor` 和 `absolute_actions_processor`，兼容 Pi0.5 checkpoint 的 processor 配置；当前训练模型中两者均为 `enabled=false`，实际仍使用绝对关节位置。
 - [`launch_value_train_run4.sh`](launch_value_train_run4.sh)：PiStar0.6 value model 训练入口。
 - [`launch_value_infer_run4_n50_r30.sh`](launch_value_infer_run4_n50_r30.sh)：value inference 与 ACP indicator 标注入口。
-- [`launch_pi05_acp_smoke_bs64.sh`](launch_pi05_acp_smoke_bs64.sh)：Pi0.5 ACP 小规模训练检查。
 - [`launch_pi05_acp_bs256_e10.sh`](launch_pi05_acp_bs256_e10.sh)：4 GPU、全局 batch size 256、10 epoch 的 Pi0.5 ACP 正式训练入口。
 - [`upload_pi05_acp_selected_epochs.py`](upload_pi05_acp_selected_epochs.py)：向 Hugging Face 上传 epoch 3、5、7、10 checkpoint。
 - [`hf_model_cards/pistart0.6-insert-carrot_README.md`](hf_model_cards/pistart0.6-insert-carrot_README.md)：PiStar0.6 value model 模型卡。
