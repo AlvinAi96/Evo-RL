@@ -23,6 +23,7 @@ class Pistar06Config(PreTrainedConfig):
     # Input fields
     task_field: str = "task"
     camera_features: list[str] = field(default_factory=list)
+    image_size: tuple[int, int] = (384, 384)
     state_feature: str = OBS_STATE
     include_state_in_prompt: bool = True
     max_state_dim: int = 32
@@ -78,6 +79,8 @@ class Pistar06Config(PreTrainedConfig):
             raise ValueError("'value.task_field' must be non-empty.")
         if not self.state_feature:
             raise ValueError("'value.state_feature' must be non-empty.")
+        if len(self.image_size) != 2 or any(size <= 0 for size in self.image_size):
+            raise ValueError("'value.image_size' must contain two positive integers.")
         if not self.state_feature.startswith("observation."):
             raise ValueError("'value.state_feature' must start with 'observation.'.")
         if not self.target_key:

@@ -175,9 +175,30 @@ def test_pistar06_processor_pads_missing_cameras_and_tokenizes(hf_stubs):
 
     assert processed[OBS_LANGUAGE_TOKENS].shape == (2, 16)
     assert processed[OBS_LANGUAGE_ATTENTION_MASK].dtype == torch.bool
-    assert processed[PISTAR06_IMAGES_KEY].shape == (2, 2, 3, 48, 40)
+    assert processed[PISTAR06_IMAGES_KEY].shape == (2, 2, 3, 384, 384)
     assert torch.equal(processed[PISTAR06_IMAGE_MASK_KEY][:, 0], torch.ones(2, dtype=torch.bool))
     assert torch.equal(processed[PISTAR06_IMAGE_MASK_KEY][:, 1], torch.zeros(2, dtype=torch.bool))
+
+
+def test_pistar06_processor_resizes_mismatched_camera_shapes(hf_stubs):
+    del hf_stubs
+    cfg = Pistar06Config(
+        device="cpu",
+        camera_features=["observation.images.front", "observation.images.side"],
+        image_size=(32, 32),
+    )
+    preprocessor, _ = make_pistar06_pre_post_processors(cfg)
+
+    raw_batch = {
+        "task": ["insert carrot", "insert carrot"],
+        OBS_STATE: torch.rand(2, 12),
+        "observation.images.front": torch.rand(2, 3, 48, 40),
+        "observation.images.side": torch.rand(2, 3, 32, 40),
+    }
+    processed = preprocessor(raw_batch)
+
+    assert processed[PISTAR06_IMAGES_KEY].shape == (2, 2, 3, 32, 32)
+    assert torch.all(processed[PISTAR06_IMAGE_MASK_KEY])
 
 
 def test_pistar06_processor_requires_task_field(hf_stubs):

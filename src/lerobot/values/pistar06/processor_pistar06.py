@@ -132,10 +132,12 @@ class Pistar06PrepareTaskPromptProcessorStep(ProcessorStep):
 @dataclass
 class Pistar06PrepareImagesProcessorStep(ProcessorStep):
     camera_features: list[str]
+    image_size: tuple[int, int] = (384, 384)
 
     def get_config(self) -> dict[str, Any]:
         return {
             "camera_features": self.camera_features,
+            "image_size": self.image_size,
         }
 
     @staticmethod
@@ -153,7 +155,15 @@ class Pistar06PrepareImagesProcessorStep(ProcessorStep):
         )
 
     def _process_camera_batch(self, img_batch: Tensor) -> Tensor:
-        return self._to_bchw(img_batch).detach().to(dtype=torch.float32)
+        image = self._to_bchw(img_batch).detach().to(dtype=torch.float32)
+        if tuple(image.shape[-2:]) != tuple(self.image_size):
+            image = functional.interpolate(
+                image,
+                size=self.image_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return image
 
     def _prepare_images(self, observation: dict[str, Any]) -> tuple[Tensor, Tensor]:
         present_img_keys = [key for key in self.camera_features if key in observation]
@@ -241,7 +251,7 @@ def make_pistar06_pre_post_processors(
             padding="max_length",
             truncation=True,
         ),
-        Pistar06PrepareImagesProcessorStep(camera_features=camera_features),
+        Pistar06PrepareImagesProcessorStep(camera_features=camera_features, image_size=config.image_size),
         DeviceProcessorStep(device=config.device),
     ]
 
