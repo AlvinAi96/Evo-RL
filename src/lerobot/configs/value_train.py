@@ -64,6 +64,8 @@ class ValueTrainPipelineConfig(HubMixin):
     tolerance_s: float = 1e-4
 
     save_checkpoint: bool = True
+    # Save optimizer/scheduler/RNG state alongside value checkpoints so training can resume.
+    save_training_state: bool = True
     save_freq: int = 4_000
 
     use_value_training_preset: bool = True
