@@ -160,6 +160,9 @@ sbatch*.sh
 # W&B
 wandb/
 
+# Generated artifacts
+/artifacts/
+
 # Dev scripts
 .dev/
 
