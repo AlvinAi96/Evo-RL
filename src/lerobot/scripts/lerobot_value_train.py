@@ -143,7 +143,6 @@ def value_train(
     accelerator.wait_for_everyone()
 
     processor_kwargs = {}
-    postprocessor_kwargs = {}
     if (cfg.value.pretrained_path and not cfg.resume) or not cfg.value.pretrained_path:
         processor_kwargs["dataset_stats"] = dataset.meta.stats
 
@@ -159,19 +158,14 @@ def value_train(
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
-        postprocessor_kwargs["postprocessor_overrides"] = {
-            "unnormalizer_processor": {
-                "stats": dataset.meta.stats,
-                "features": cfg.value.output_features or {},
-                "norm_map": cfg.value.normalization_mapping,
-            },
-        }
+
+    # Pistar06 predicts values, and its saved postprocessor only moves tensors
+    # to the output device. It has no action unnormalizer to override.
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.value,
         pretrained_path=cfg.value.pretrained_path,
         **processor_kwargs,
-        **postprocessor_kwargs,
     )
 
     if is_main_process:

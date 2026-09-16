@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=evo-value-infer-r1
+#SBATCH --partition=workq
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gpus=4
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=460000M
+#SBATCH --time=04:00:00
+#SBATCH --output=/scratch/u6pw/ql337.u6pw/projects/Evo-RL/logs/slurm-%x-%j.out
+#SBATCH --error=/scratch/u6pw/ql337.u6pw/projects/Evo-RL/logs/slurm-%x-%j.err
 set -euo pipefail
 
 cd /scratch/u6pw/ql337.u6pw/projects/Evo-RL
@@ -7,7 +17,9 @@ cd /scratch/u6pw/ql337.u6pw/projects/Evo-RL
 exec .venv/bin/accelerate launch \
   --multi_gpu \
   --num_processes=4 \
+  --num_machines=1 \
   --mixed_precision=bf16 \
+  --dynamo_backend=no \
   .venv/bin/lerobot-value-infer \
   --dataset.repo_id="$DATASET_REPO_R1" \
   --dataset.root="$DATASET_ROOT_R1" \

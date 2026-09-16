@@ -7,7 +7,7 @@ DATASET_ROOT_R1="/scratch/u6pw/ql337.u6pw/data/lerobot/AlvinAi/insert_carrot_int
 VALUE_TAG_R1="pistar06_v2_r1_n50_r30"
 VALUE_OUTPUT_R1="/scratch/u6pw/ql337.u6pw/projects/Evo-RL/outputs/value_train/pistar06_insert_carrot_v2_r1"
 VALUE_INFER_OUTPUT_R1="/scratch/u6pw/ql337.u6pw/projects/Evo-RL/outputs/value_infer/pistar06_insert_carrot_v2_r1_n50_r30"
-VALUE_CHECKPOINT_R1="$VALUE_OUTPUT_R1"
+VALUE_CHECKPOINT_R1="$VALUE_OUTPUT_R1/continued_from_000500_6581542"
 
 ACP_VALUE_FIELD_R1="complementary_info.value_${VALUE_TAG_R1}"
 ACP_ADVANTAGE_FIELD_R1="complementary_info.advantage_${VALUE_TAG_R1}"
