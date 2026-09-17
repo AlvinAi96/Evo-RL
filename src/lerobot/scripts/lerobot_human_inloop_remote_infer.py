@@ -44,7 +44,7 @@ from lerobot.async_inference.helpers import (
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
-from lerobot.processor import ImageBorderConfig, RobotAction, make_default_processors
+from lerobot.processor import RobotAction, make_default_processors
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -124,7 +124,6 @@ class HumanInloopRemoteInferConfig:
     display_ip: str | None = None
     display_port: int | None = None
     display_compressed_images: bool = False
-    image_border: ImageBorderConfig = field(default_factory=ImageBorderConfig)
     play_sounds: bool = True
     policy_sync_to_teleop: bool = True
     policy_sync_parallel: bool = True
@@ -526,10 +525,7 @@ def _remote_human_inloop_loop(
     display_compressed_images: bool,
 ) -> None:
     """执行不写数据集的 HIL 控制循环。"""
-    # 纯远程推理也复用边框 processor，保证与重新采集/训练的数据分布一致。
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
-        image_border=cfg.image_border
-    )
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     has_teleop = teleop is not None
     intervention_enabled = cfg.intervention_state_machine_enabled and has_teleop
     intervention_state = INTERVENTION_STATE_POLICY
@@ -600,7 +596,10 @@ def _remote_human_inloop_loop(
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
             action_values = act_processed_teleop or last_teleop_action or act_processed_policy or zero_policy_action
         else:
-            action_values = act_processed_policy if act_processed_policy is not None else act_processed_teleop
+            # Policy buffer starvation is not a request for manual takeover.
+            # Leave the follower's last commanded target in place while waiting;
+            # only an explicit intervention may send the leader's pose.
+            action_values = act_processed_policy
 
         if action_values is None:
             precise_sleep(max(cfg.environment_dt - (time.perf_counter() - loop_start), 0.0))

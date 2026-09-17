@@ -150,7 +150,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     mode: str = "bilinear",
 ) -> torch.Tensor:
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
-    by padding with black. If the image is float32, it must be in the range [-1, 1].
+    by padding with black. Float inputs are expected in [0, 1] and are normalized later.
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
@@ -191,7 +191,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     if images.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
     elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(-1.0, 1.0)
+        resized_images = resized_images.clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported image dtype: {images.dtype}")
 
@@ -202,7 +202,8 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    # This helper runs before [0,1] -> [-1,1] normalization, so black is 0 here.
+    constant_value = 0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom

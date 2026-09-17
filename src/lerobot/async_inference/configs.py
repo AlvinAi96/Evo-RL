@@ -13,11 +13,10 @@
 # limitations under the License.
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 import torch
 
-from lerobot.processor import ImageBorderConfig
 from lerobot.robots.config import RobotConfig
 
 from .constants import (
@@ -149,9 +148,6 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
-    # 可选图像内边框；独立 async robot_client 会在发送 observation 前应用。
-    image_border: ImageBorderConfig = field(default_factory=ImageBorderConfig)
-
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -187,11 +183,6 @@ class RobotClientConfig:
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "RobotClientConfig":
-        """从普通 dict 恢复 RobotClientConfig，并处理嵌套的边框配置。"""
-        config_dict = dict(config_dict)
-        if isinstance(config_dict.get("image_border"), dict):
-            # 从 JSON/dict 恢复配置时，显式还原成 dataclass，避免后续访问 enable/width_px 失败。
-            config_dict["image_border"] = ImageBorderConfig(**config_dict["image_border"])
         return cls(**config_dict)
 
     def to_dict(self) -> dict:
@@ -208,5 +199,4 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
-            "image_border": asdict(self.image_border),
         }

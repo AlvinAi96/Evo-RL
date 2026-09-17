@@ -49,7 +49,6 @@ from .hil_processor import (
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
-from .image_border_processor import ImageBorderConfig, ImageBorderProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
 from .pipeline import (
@@ -74,13 +73,13 @@ from .policy_robot_bridge import (
     PolicyActionToRobotActionProcessorStep,
     RobotActionToPolicyActionProcessorStep,
 )
-from .rename_processor import RenameObservationsProcessorStep
 from .relative_action_processor import (
     AbsoluteActionsProcessorStep,
     RelativeActionsProcessorStep,
     to_absolute_actions,
     to_relative_actions,
 )
+from .rename_processor import RenameObservationsProcessorStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
 __all__ = [
@@ -98,8 +97,6 @@ __all__ = [
     "GripperPenaltyProcessorStep",
     "hotswap_stats",
     "IdentityProcessorStep",
-    "ImageBorderConfig",
-    "ImageBorderProcessorStep",
     "ImageCropResizeProcessorStep",
     "InfoProcessorStep",
     "InterventionActionProcessorStep",

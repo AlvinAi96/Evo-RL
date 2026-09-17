@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from lerobot.configs.train import ACPConfig
+from lerobot.rl.acp_success_filter import find_success_episode_indices
 from lerobot.rl.acp_tags import build_acp_tagged_task
 
 
@@ -45,13 +46,38 @@ def _extract_indicators(values: Any, batch_size: int) -> list[bool]:
 
 
 class ACPPromptHook:
-    def __init__(self, cfg: ACPConfig, seed: int | None):
+    def __init__(
+        self,
+        cfg: ACPConfig,
+        seed: int | None,
+        success_episode_indices: list[int] | None = None,
+    ):
+        self.prompt_source = cfg.prompt_source
         self.indicator_field = cfg.indicator_field
         self.dropout = cfg.indicator_dropout_prob
         self.tag_negative_prompts = cfg.tag_negative_prompts
+        self.success_episode_indices = (
+            set(success_episode_indices) if success_episode_indices is not None else None
+        )
         self.rng = random.Random(seed if seed is not None else 0)
 
     def _resolve_indicators(self, batch: dict[str, Any], batch_size: int) -> list[bool]:
+        if self.prompt_source == "episode_success":
+            if self.success_episode_indices is None:
+                raise RuntimeError("ACP episode_success prompt source was not initialized from a dataset.")
+            if "episode_index" not in batch:
+                raise KeyError("ACP episode_success prompt source requires 'episode_index' in batch.")
+            values = batch["episode_index"]
+            if isinstance(values, torch.Tensor):
+                episode_indices = values.detach().cpu().tolist()
+            else:
+                episode_indices = list(values)
+            if len(episode_indices) != batch_size:
+                raise ValueError(
+                    f"ACP batch size mismatch: expected {batch_size}, got {len(episode_indices)}."
+                )
+            return [int(value) in self.success_episode_indices for value in episode_indices]
+
         if self.indicator_field not in batch:
             raise KeyError(f"ACP indicator field '{self.indicator_field}' is missing from batch.")
         return _extract_indicators(batch[self.indicator_field], batch_size)
@@ -86,7 +112,16 @@ class ACPPromptHook:
         return batch
 
 
-def build_acp_raw_batch_hook(cfg: ACPConfig, seed: int | None) -> Callable[[Any, int], Any] | None:
+def build_acp_raw_batch_hook(
+    cfg: ACPConfig,
+    seed: int | None,
+    dataset: Any | None = None,
+) -> Callable[[Any, int], Any] | None:
     if not cfg.enable:
         return None
-    return ACPPromptHook(cfg, seed)
+    success_episode_indices = None
+    if cfg.prompt_source == "episode_success":
+        if dataset is None:
+            raise ValueError("ACP prompt_source='episode_success' requires a loaded dataset.")
+        success_episode_indices = find_success_episode_indices(dataset.meta.episodes, cfg.success_field)
+    return ACPPromptHook(cfg, seed, success_episode_indices)

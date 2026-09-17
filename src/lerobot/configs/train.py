@@ -36,10 +36,12 @@ TRAIN_CONFIG_NAME = "train_config.json"
 @dataclass
 class ACPConfig:
     enable: bool = False
+    prompt_source: str = "indicator"
     indicator_field: str = "complementary_info.acp_indicator"
     indicator_dropout_prob: float = 0.1
     tag_negative_prompts: bool = False
-    failure_loss_mode: str = "mask_loss"
+    # RECAP/CFG trains unconditional samples too; mask/drop are ablation options.
+    failure_loss_mode: str = "keep_loss"
     success_field: str = "episode_success"
 
 
@@ -156,15 +158,20 @@ class TrainPipelineConfig(HubMixin):
 
         if not 0.0 <= self.acp.indicator_dropout_prob <= 1.0:
             raise ValueError("'acp.indicator_dropout_prob' must be within [0, 1].")
-        if self.acp.enable and not self.acp.indicator_field:
+        if self.acp.prompt_source not in {"indicator", "episode_success"}:
+            raise ValueError("'acp.prompt_source' must be one of: indicator, episode_success.")
+        if self.acp.enable and self.acp.prompt_source == "indicator" and not self.acp.indicator_field:
             raise ValueError("'acp.indicator_field' must be set when 'acp.enable=true'.")
+        if self.acp.enable and self.acp.prompt_source == "episode_success" and not self.acp.success_field:
+            raise ValueError("'acp.success_field' must be set when acp.prompt_source='episode_success'.")
         if self.acp.failure_loss_mode not in {"mask_loss", "drop", "keep_loss"}:
             raise ValueError("'acp.failure_loss_mode' must be one of: mask_loss, drop, keep_loss.")
-        if self.acp.enable and self.acp.failure_loss_mode in {"mask_loss", "drop"}:
-            if not self.acp.success_field:
-                raise ValueError(
-                    "'acp.success_field' must be set when ACP success-only loss is enabled."
-                )
+        if (
+            self.acp.enable
+            and self.acp.failure_loss_mode in {"mask_loss", "drop"}
+            and not self.acp.success_field
+        ):
+            raise ValueError("'acp.success_field' must be set when ACP success-only loss is enabled.")
 
         if self.use_rabc and not self.rabc_progress_path:
             # Auto-detect from dataset path

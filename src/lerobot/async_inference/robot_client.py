@@ -97,10 +97,7 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
-        # 直接 async client 不经过 record_loop，这里单独接入 observation processor。
-        self.robot_observation_processor = make_default_robot_observation_processor(
-            image_border=config.image_border
-        )
+        self.robot_observation_processor = make_default_robot_observation_processor()
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 

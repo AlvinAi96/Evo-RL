@@ -1,13 +1,20 @@
 #!/usr/bin/env python
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 from torch import nn
 
+from lerobot.policies.pi0.modeling_pi0 import resize_with_pad_torch as pi0_resize_with_pad
+from lerobot.policies.pi0_fast.modeling_pi0_fast import resize_with_pad_torch as pi0_fast_resize_with_pad
 from lerobot.policies.pi05.configuration_pi05 import PI05Config, PI05DepthAlignConfig
 from lerobot.policies.pi05.depth_align import (
+    PI05DepthTargetGenerator,
     compute_depth_alignment_loss,
     save_depth_alignment_visualization,
 )
+from lerobot.policies.pi05.modeling_pi05 import resize_with_pad_torch
 
 
 def test_pi05_depth_align_defaults_to_disabled():
@@ -15,6 +22,21 @@ def test_pi05_depth_align_defaults_to_disabled():
 
     assert cfg.depth_align.enable is False
     assert cfg.depth_align.visualize.enable is False
+
+
+@pytest.mark.parametrize(
+    "resize",
+    [resize_with_pad_torch, pi0_resize_with_pad, pi0_fast_resize_with_pad],
+)
+def test_pi_family_float_resize_uses_zero_before_normalization(resize):
+    image = torch.ones(1, 3, 2, 4, dtype=torch.float32)
+
+    resized = resize(image, 4, 4)
+    normalized = resized * 2.0 - 1.0
+
+    assert resized.min().item() == 0.0
+    assert normalized.min().item() == -1.0
+    assert normalized.max().item() == 1.0
 
 
 def test_pi05_depth_align_supports_two_cameras():
@@ -39,6 +61,32 @@ def test_pi05_depth_align_supports_two_cameras():
 
     assert loss.ndim == 0
     assert depth_preds.shape == (4, 4, 3)
+
+
+def test_depth_teacher_accepts_different_camera_aspect_ratios():
+    class FakeMoge:
+        def infer(self, images, **_):
+            return {"depth": images.mean(dim=1)}
+
+    class FakeLingBot:
+        def infer_feat(self, images, depth, **_):
+            values = images.mean(dim=(1, 2, 3))
+            height = 2 if images.shape[-2] < images.shape[-1] else 3
+            features = values[:, None, None, None].expand(-1, 3, height, 4).clone()
+            return features, depth
+
+    generator = PI05DepthTargetGenerator.__new__(PI05DepthTargetGenerator)
+    generator.config = SimpleNamespace(resolution_level=3, target_num_tokens=16, target_token_size=2)
+    generator.device = torch.device("cpu")
+    generator.moge_model = FakeMoge()
+    generator.lingbot_depth_model = FakeLingBot()
+    front = torch.stack([torch.full((3, 6, 8), 0.1), torch.full((3, 6, 8), 0.2)])
+    side = torch.stack([torch.full((3, 4, 8), 0.3), torch.full((3, 4, 8), 0.4)])
+
+    targets = generator([front, side])
+
+    assert targets.shape == (4, 4, 3)
+    assert torch.allclose(targets[:, 0, 0], torch.tensor([0.1, 0.3, 0.2, 0.4]))
 
 
 def test_pi05_depth_align_visualization_writes_debug_images(tmp_path):

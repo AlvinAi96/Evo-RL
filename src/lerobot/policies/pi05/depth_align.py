@@ -48,41 +48,63 @@ class PI05DepthTargetGenerator:
 
     @torch.no_grad()
     def __call__(self, images: list[Tensor]) -> Tensor:
-        """把 Pi0.5 已 resize/normalize 的多相机图像转成 LingBot-Depth feature target。"""
+        """从各相机原始宽高比 RGB 生成 LingBot-Depth feature target。"""
         if not images:
             raise ValueError("Depth alignment needs at least one image tensor.")
 
-        image_stack = torch.stack(images, dim=1)
-        bsize, num_cameras = image_stack.shape[:2]
-        flat_images = image_stack.reshape(bsize * num_cameras, *image_stack.shape[2:])
+        camera_targets = []
+        for image in images:
+            if image.ndim != 4:
+                raise ValueError(f"Expected batched image tensor, got {tuple(image.shape)}.")
+            if image.shape[1] == 3:
+                input_images = image
+            elif image.shape[-1] == 3:
+                input_images = image.permute(0, 3, 1, 2)
+            else:
+                raise ValueError(f"Could not locate RGB channels in image shape {tuple(image.shape)}.")
 
-        # Pi0.5 图像进入 policy 前是 [-1, 1]；teacher 需要 [0, 1] RGB。
-        input_images = ((flat_images.to(self.device, dtype=torch.float32) + 1.0) / 2.0).clamp(0.0, 1.0)
-        output_moge = self.moge_model.infer(
-            input_images,
-            resolution_level=self.config.resolution_level,
-            num_tokens=self.config.target_num_tokens,
-            apply_mask=False,
-        )
-        depth_pred = output_moge["depth"].detach().clone()
-        if depth_pred.ndim == 4 and depth_pred.shape[1] == 1:
-            depth_pred = depth_pred[:, 0]
-        depth_pred = torch.nan_to_num(depth_pred, nan=0.0, posinf=0.0, neginf=0.0)
+            input_images = input_images.to(self.device, dtype=torch.float32)
+            if bool((input_images < 0).any()):
+                input_images = (input_images + 1.0) / 2.0
+            input_images = input_images.clamp(0.0, 1.0)
 
-        depth_target, _ = self.lingbot_depth_model.infer_feat(
-            input_images,
-            depth_pred,
-            depth_down_scale=1,
-            resolution_level=self.config.resolution_level,
-            num_tokens=self.config.target_num_tokens,
-            enable_depth_mask=False,
-        )
-        if depth_target.ndim != 4:
-            raise ValueError(f"Unexpected LingBot-Depth target shape: {tuple(depth_target.shape)}")
+            # Cameras may have different native resolutions, so run them separately.
+            output_moge = self.moge_model.infer(
+                input_images,
+                resolution_level=self.config.resolution_level,
+                num_tokens=self.config.target_num_tokens,
+                apply_mask=False,
+            )
+            depth_pred = output_moge["depth"].detach().clone()
+            if depth_pred.ndim == 4 and depth_pred.shape[1] == 1:
+                depth_pred = depth_pred[:, 0]
+            depth_pred = torch.nan_to_num(depth_pred, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # LingBot-Depth 输出 [B*N, D, H, W]，训练 loss 使用 [B*N, H*W, D]。
-        depth_target = depth_target.permute(0, 2, 3, 1).contiguous()
-        return depth_target.view(depth_target.shape[0], -1, depth_target.shape[-1])
+            depth_target, _ = self.lingbot_depth_model.infer_feat(
+                input_images,
+                depth_pred,
+                depth_down_scale=1,
+                resolution_level=self.config.resolution_level,
+                num_tokens=self.config.target_num_tokens,
+                enable_depth_mask=False,
+            )
+            if depth_target.ndim != 4:
+                raise ValueError(f"Unexpected LingBot-Depth target shape: {tuple(depth_target.shape)}")
+            if depth_target.shape[-2:] != (
+                self.config.target_token_size,
+                self.config.target_token_size,
+            ):
+                depth_target = F.interpolate(
+                    depth_target,
+                    size=(self.config.target_token_size, self.config.target_token_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            camera_targets.append(depth_target.permute(0, 2, 3, 1).contiguous())
+
+        # Align ordering with policy predictions: [batch, camera, token, feature].
+        stacked = torch.stack(camera_targets, dim=1)
+        return stacked.view(-1, stacked.shape[-3] * stacked.shape[-2], stacked.shape[-1])
 
 
 def make_depth_align_head(hidden_dim: int, target_dim: int) -> nn.Module:

@@ -190,7 +190,6 @@ def train(
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
     cfg.validate()
-    acp_raw_batch_hook = build_acp_raw_batch_hook(cfg.acp, cfg.seed)
 
     # Create Accelerator if not provided
     # It will automatically detect if running in distributed mode or single-process mode
@@ -236,7 +235,7 @@ def train(
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
-        if cfg.acp.enable:
+        if cfg.acp.enable and cfg.acp.prompt_source == "indicator":
             indicator_stats = compute_acp_indicator_stats(dataset, cfg.acp.indicator_field)
             if indicator_stats is None:
                 logging.warning(
@@ -272,6 +271,14 @@ def train(
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+
+    acp_raw_batch_hook = build_acp_raw_batch_hook(cfg.acp, cfg.seed, dataset=dataset)
+    if is_main_process and cfg.acp.enable and cfg.acp.prompt_source == "episode_success":
+        logging.info(
+            "ACP prompt source: episode_success field='%s' positive_probability=%.3f",
+            cfg.acp.success_field,
+            1.0 - cfg.acp.indicator_dropout_prob,
+        )
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,

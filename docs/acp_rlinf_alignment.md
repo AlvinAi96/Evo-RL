@@ -15,7 +15,18 @@
 
 - 正样本：大部分使用 `Advantage: positive`，少量通过 dropout 保留 base task。
 - 负样本：默认只使用 base task，不再追加 `Advantage: negative`。
-- Loss：默认只用成功轨迹产生 loss，失败轨迹的处理由配置决定。
+- Loss：正负样本都参与 policy BC loss；负样本负责学习无条件/base 分支。
+
+注意：RLinf/RECAP 的正负样本来自逐帧 Advantage 分位数，而不是直接把成功 episode
+视为正样本、失败 episode 视为负样本。默认 top 30% 为正样本，再对正样本做 0.1
+unconditional dropout，因此最终约 27% 是 positive prompt、73% 是 base prompt。
+
+已核对 RLinf `ee2cab65` 源码：CFG dataloader 不按 episode 成败过滤数据，
+`openpi_cfg_action_model.py` 的 flow matching loss 对整个 batch 直接求均值。负
+Advantage 样本虽然被路由到 unconditional/base prompt，但仍产生动作 loss。配置项
+`train_expert_only` 表示只更新 action expert 参数并冻结 VLM，不表示只使用成功专家轨迹。
+“只训练成功专家轨迹”只适用于 CFG 之前的初始 SFT 数据来源描述，不适用于 RECAP 的
+CFG policy optimization 阶段。
 
 ## Prompt 配置
 
@@ -24,6 +35,8 @@ ACP 配置位于 `src/lerobot/configs/train.py` 的 `ACPConfig`。
 关键字段：
 
 - `acp.enable`: 是否开启 ACP prompt hook。
+- `acp.prompt_source`: `indicator` 使用逐帧 Advantage 标签；`episode_success` 使用整条
+  episode 的成功/失败标签。
 - `acp.indicator_field`: 数据集中 0/1 Advantage indicator 字段。
 - `acp.indicator_dropout_prob`: 正样本 tag dropout 概率，默认 `0.1`。
 - `acp.tag_negative_prompts`: 是否继续给负样本追加 `Advantage: negative`，默认 `false`。
@@ -45,13 +58,14 @@ ACP 配置位于 `src/lerobot/configs/train.py` 的 `ACPConfig`。
 
 ## 失败轨迹 Loss 配置
 
-`acp.failure_loss_mode` 控制失败轨迹如何参与 ACP 训练，默认 `mask_loss`。
+`acp.failure_loss_mode` 控制失败轨迹如何参与 ACP 训练。默认 `keep_loss`，与
+RLinf/RECAP 中无条件样本同样参与 policy loss 的做法一致。
 
 | 配置 | 行为 |
 | --- | --- |
 | `mask_loss` | 失败轨迹进入 dataloader 和模型 forward，但 loss 权重为 0；只对成功轨迹反传。 |
 | `drop` | 构造 dataset 时只加载成功 episode，失败轨迹不进入 dataloader。 |
-| `keep_loss` | 失败轨迹正常进入 dataloader 且正常计算 loss，用于兼容旧训练方式。 |
+| `keep_loss` | 失败轨迹正常进入 dataloader 且正常计算 loss。 |
 
 成功标签从 episode metadata 读取：
 
@@ -61,16 +75,28 @@ ACP 配置位于 `src/lerobot/configs/train.py` 的 `ACPConfig`。
 
 `mask_loss` 模式依赖 batch 中的 `episode_index`，训练时会根据成功 episode 集合生成 0/1 per-sample loss 权重。若同时开启 RA-BC，两者权重会相乘后再归一。
 
-推荐 ACP 命令片段：
+严格按 RLinf/RECAP 的 Advantage 标签训练：
 
 ```bash
 --acp.enable=true \
+--acp.prompt_source=indicator \
 --acp.indicator_field=complementary_info.acp_indicator_<TAG> \
 --acp.indicator_dropout_prob=0.1 \
 --acp.tag_negative_prompts=false \
---acp.failure_loss_mode=mask_loss \
---acp.success_field=episode_success
+--acp.failure_loss_mode=keep_loss
 ```
+
+按 episode 成败组织 prompt 是本项目额外支持的策略，并非 RLinf 原始定义：
+
+```bash
+--acp.prompt_source=episode_success \
+--acp.success_field=episode_success \
+--acp.indicator_dropout_prob=0.1 \
+--acp.failure_loss_mode=keep_loss
+```
+
+这会得到成功样本期望 90% positive、10% base，失败样本 100% base，且两者都参与
+policy BC loss。
 
 如果希望失败轨迹完全不进 dataloader：
 
@@ -210,10 +236,6 @@ python -m lerobot.scripts.lerobot_human_inloop_record \
   --dataset.push_to_hub=false \
   --dataset.vcodec=h264 \
   --display_data=true \
-  --image_border.enable=true \
-  --image_border.width_px=12 \
-  --image_border.color_rgb='[0, 96, 255]' \
-  --image_border.keys='[front, side]' \
   --resume=false
 ```
 
@@ -331,6 +353,7 @@ python -m lerobot.scripts.lerobot_value_infer \
   --acp.n_step=50 \
   --acp.positive_ratio=0.3 \
   --acp.value_field=complementary_info.value_pistar06_v2_r1_n50_r30 \
+  --acp.target_field=complementary_info.value_target_pistar06_v2_r1_n50_r30 \
   --acp.advantage_field=complementary_info.advantage_pistar06_v2_r1_n50_r30 \
   --acp.indicator_field=complementary_info.acp_indicator_pistar06_v2_r1_n50_r30 \
   --output_dir=/root/autodl-tmp/outputs/value_infer/pistar06_insert_carrot_v2_r1_n50_r30 \
@@ -339,9 +362,10 @@ python -m lerobot.scripts.lerobot_value_infer \
 
 说明：
 
-- 这一步会把 `value/advantage/acp_indicator` 写回 `--dataset.root` 对应的数据集。
+- 这一步会把 `value/value_target/advantage/acp_indicator` 写回 `--dataset.root` 对应的数据集。
 - `--acp.positive_ratio=0.3` 表示按 task 内 advantage 取 top 30% 为正样本。
-- ACP policy 训练时的 `--acp.indicator_field` 必须和这里写出的 indicator 字段完全一致。
+- 下方推荐的 RLinf/RECAP 式 policy 训练直接使用该 indicator：top 30% Advantage
+  样本进入 positive prompt，其余样本进入 base prompt。
 
 如果要把标注后的数据集同步回 Hugging Face：
 
@@ -369,11 +393,11 @@ python -m lerobot.scripts.lerobot_train \
   --save_freq=3000 \
   --log_freq=10 \
   --acp.enable=true \
+  --acp.prompt_source=indicator \
   --acp.indicator_field=complementary_info.acp_indicator_pistar06_v2_r1_n50_r30 \
   --acp.indicator_dropout_prob=0.1 \
   --acp.tag_negative_prompts=false \
-  --acp.failure_loss_mode=mask_loss \
-  --acp.success_field=episode_success \
+  --acp.failure_loss_mode=keep_loss \
   --output_dir=/root/autodl-tmp/outputs/train/pi05_insert_carrot_v2_r1_acp_n50_r30 \
   --job_name=pi05_insert_carrot_v2_r1_acp_n50_r30 \
   --wandb.enable=false \
@@ -427,11 +451,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
   --save_training_state=false \
   --log_freq=10 \
   --acp.enable=true \
+  --acp.prompt_source=indicator \
   --acp.indicator_field=complementary_info.acp_indicator_pistar06_v2_r1_n50_r30 \
   --acp.indicator_dropout_prob=0.1 \
   --acp.tag_negative_prompts=false \
-  --acp.failure_loss_mode=mask_loss \
-  --acp.success_field=episode_success \
+  --acp.failure_loss_mode=keep_loss \
   --output_dir=/root/autodl-tmp/outputs/train/pi05_insert_carrot_v2_r1_acp_n50_r30 \
   --job_name=pi05_insert_carrot_v2_r1_acp_n50_r30 \
   --wandb.enable=true \
@@ -444,10 +468,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
 
 说明：
 
+- 当前命令采用 RLinf/RECAP 式 `indicator + keep_loss`：按逐帧 Advantage top 30%
+  生成 indicator；正样本中 90% 使用 positive prompt、10% 使用 base prompt，负样本
+  全部使用 base prompt，所有样本都参与 loss。
 - `mask_loss`：失败轨迹进入 dataloader 和模型 forward，但 loss 权重为 0。
 - `drop`：失败 episode 在 dataset 构造阶段被过滤，不进入 dataloader。
-- `keep_loss`：失败轨迹正常计算 loss，用于旧实验兼容。
-- 当前默认 CFG 训练分布是：正样本 90% positive tag、10% base；负样本 100% base。
+- `keep_loss`：失败轨迹正常计算 loss，也是 RLinf/RECAP 无条件样本的训练语义。
+- `positive_ratio=0.3` 与 `indicator_dropout_prob=0.1` 组合后，期望约 27% 样本使用
+  positive prompt、73% 使用 base prompt。
 - 不加 `--policy.depth_align.enable=true` 时就是原 ACP policy 训练，不加载 MoGe/LingBot-Depth。
 - 开启 depth 后，MoGe/LingBot-Depth 冻结产 teacher target，梯度只回传到 Pi0.5 可训练参数和新增 `depth_align_head`。
 - `depth_align.visualize.enable=true` 只保存 RGB/teacher feature/policy feature 对齐图，方便初期检查；确认无误后建议关闭以减少训练 I/O。
@@ -515,10 +543,6 @@ python -m lerobot.scripts.lerobot_human_inloop_remote_infer \
   --acp_inference.use_cfg=true \
   --acp_inference.velocity_cfg=true \
   --acp_inference.cfg_beta=1.0 \
-  --image_border.enable=true \
-  --image_border.width_px=12 \
-  --image_border.color_rgb='[0, 96, 255]' \
-  --image_border.keys='[front, side]' \
   --display_data=true
 ```
 
@@ -570,10 +594,6 @@ python -m lerobot.scripts.lerobot_human_inloop_remote_record \
   --acp_inference.use_cfg=true \
   --acp_inference.velocity_cfg=true \
   --acp_inference.cfg_beta=1.0 \
-  --image_border.enable=true \
-  --image_border.width_px=12 \
-  --image_border.color_rgb='[0, 96, 255]' \
-  --image_border.keys='[front, side]' \
   --resume=false
 ```
 

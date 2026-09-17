@@ -23,14 +23,14 @@ import torch
 from PIL import Image, ImageDraw
 from torch.utils.data._utils.collate import default_collate
 
-# Importing the concrete config registers the draccus choice before train_config is decoded.
-from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: F401
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.factory import make_dataset
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+
+# Importing the concrete config registers the draccus choice before train_config is decoded.
+from lerobot.policies.pi05.configuration_pi05 import PI05Config  # noqa: F401
 from lerobot.rl.acp_tags import build_acp_tagged_task
 from lerobot.utils.constants import ACTION, OBS_STATE
-
 
 DEFAULT_CHECKPOINT = Path(
     "outputs/train/pi05_insert_carrot_hil_acp_bs256_e10/checkpoints/001580/pretrained_model"
@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg-beta", type=float, default=0.6)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--min-start-frame", type=int, default=20)
+    parser.add_argument(
+        "--advantage-field",
+        default="complementary_info.advantage",
+        help="Optional dataset field copied into sample metadata.",
+    )
     return parser.parse_args()
 
 
@@ -64,11 +69,10 @@ def clone_batch(batch: dict[str, Any]) -> dict[str, Any]:
 
 
 def choose_samples(dataset: Any, indicator_field: str, count: int, seed: int, min_start: int) -> list[int]:
-    if count < 2:
-        raise ValueError("--num-samples must be at least 2 so both ACP classes can be represented.")
+    if count < 1:
+        raise ValueError("--num-samples must be positive.")
 
     table = dataset.hf_dataset
-    indicators = np.asarray(table[indicator_field], dtype=np.int64)
     episode_ids = np.asarray(table["episode_index"], dtype=np.int64)
     frame_ids = np.asarray(table["frame_index"], dtype=np.int64)
     pad_margin = int(dataset.delta_indices[ACTION][-1]) if dataset.delta_indices else 0
@@ -88,6 +92,25 @@ def choose_samples(dataset: Any, indicator_field: str, count: int, seed: int, mi
     )
 
     rng = np.random.default_rng(seed)
+    if indicator_field not in table.column_names:
+        candidates = np.flatnonzero(valid)
+        rng.shuffle(candidates)
+        selected = []
+        used_episodes = set()
+        for index in candidates:
+            episode = int(episode_ids[index])
+            if episode in used_episodes:
+                continue
+            selected.append(int(index))
+            used_episodes.add(episode)
+            if len(selected) == count:
+                return selected
+        selected.extend(int(index) for index in candidates if int(index) not in set(selected))
+        if len(selected) < count:
+            raise RuntimeError(f"Could only select {len(selected)} valid samples.")
+        return selected[:count]
+
+    indicators = np.asarray(table[indicator_field], dtype=np.int64)
     target_counts = {1: count // 2, 0: count - count // 2}
     selected: list[int] = []
     used_episodes: set[int] = set()
@@ -184,8 +207,8 @@ def save_action_plot(
         "ground truth": "#111111",
         "train_tag": "#2ca02c",
         "positive": "#d62728",
-        "uncond": "#9467bd",
-        "cfg_beta_0.6": "#1f77b4",
+        "base": "#9467bd",
+        "velocity_cfg": "#1f77b4",
         "hold_state": "#999999",
     }
     width, row_height, left, right = 1120, 145, 125, 25
@@ -194,8 +217,10 @@ def save_action_plot(
     draw = ImageDraw.Draw(canvas)
     draw.text((12, 10), title, fill="black")
     legend_x = 12
-    for label in ["ground truth", "train_tag", "positive", "uncond", "cfg_beta_0.6", "hold_state"]:
-        draw.line((legend_x, 38, legend_x + 24, 38), fill=colors[label], width=4)
+    legend_labels = ["ground truth", *predictions, "hold_state"]
+    for label in legend_labels:
+        color = colors.get(label, colors["velocity_cfg"])
+        draw.line((legend_x, 38, legend_x + 24, 38), fill=color, width=4)
         draw.text((legend_x + 29, 30), label, fill="#222222")
         legend_x += 165
 
@@ -215,17 +240,41 @@ def save_action_plot(
         draw.text((8, y + 27), action_names[joint], fill="black")
         draw.text((8, y + 50), f"{low:.2f} .. {high:.2f}", fill="#666666")
         _draw_polyline(
-            draw, baseline[:, joint], left, y + 8, plot_width, row_height - 26, low, high,
-            colors["hold_state"], 2,
+            draw,
+            baseline[:, joint],
+            left,
+            y + 8,
+            plot_width,
+            row_height - 26,
+            low,
+            high,
+            colors["hold_state"],
+            2,
         )
         for mode, value in predictions.items():
             _draw_polyline(
-                draw, value[:, joint], left, y + 8, plot_width, row_height - 26, low, high,
-                colors[mode], 3,
+                draw,
+                value[:, joint],
+                left,
+                y + 8,
+                plot_width,
+                row_height - 26,
+                low,
+                high,
+                colors.get(mode, colors["velocity_cfg"]),
+                3,
             )
         _draw_polyline(
-            draw, truth[:, joint], left, y + 8, plot_width, row_height - 26, low, high,
-            colors["ground truth"], 4,
+            draw,
+            truth[:, joint],
+            left,
+            y + 8,
+            plot_width,
+            row_height - 26,
+            low,
+            high,
+            colors["ground truth"],
+            4,
         )
     canvas.save(path)
 
@@ -340,14 +389,14 @@ img {{ display: block; max-width: 1120px; width: 100%; margin: 10px 0; }}
 code {{ background: #f3f3f3; padding: 2px 4px; }}
 </style></head><body>
 <h1>Pi0.5 ACP open-loop train-set evaluation</h1>
-<p>All prompt modes use identical sampled frames and identical initial diffusion noise. The
-<code>cfg_beta_{cfg_beta}</code> action is <code>uncond + {cfg_beta} × (positive − uncond)</code>.
+<p>All prompt modes use identical sampled frames and identical initial diffusion noise.
+<code>velocity_cfg_beta_{cfg_beta}</code> applies classifier-free guidance at every denoising step.
 Metrics compare predicted 50-step action chunks against recorded training actions in original
 joint units. <code>hold_state</code> repeats the observed joint state as a simple baseline.</p>
 <table><thead><tr><th>Mode</th><th>MAE</th><th>RMSE</th><th>Step-0 MAE</th>
 <th>First-10 MAE</th><th>Endpoint MAE</th><th>Correlation</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table>
-{''.join(cards)}
+<tbody>{"".join(rows)}</tbody></table>
+{"".join(cards)}
 </body></html>"""
     path.write_text(document, encoding="utf-8")
 
@@ -375,16 +424,20 @@ def main() -> None:
         )
     }
     sample_metadata: list[dict[str, Any]] = []
+    has_indicator = indicator_field in dataset.hf_dataset.column_names
     for sample_id, (index, sample) in enumerate(zip(indices, samples, strict=True)):
         episode = int(sample["episode_index"])
+        success = episode_success[episode]
         item = {
             "sample_id": sample_id,
             "dataset_index": index,
             "episode_index": episode,
             "frame_index": int(sample["frame_index"]),
-            "acp_indicator": int(sample[indicator_field]),
-            "advantage": float(sample["complementary_info.advantage_pistar06_run4_n50_r30"]),
-            "episode_success": episode_success[episode],
+            "acp_indicator": (int(sample[indicator_field]) if has_indicator else int(success == "success")),
+            "advantage": (
+                float(sample[args.advantage_field]) if args.advantage_field in sample else float("nan")
+            ),
+            "episode_success": success,
         }
         sample_metadata.append(item)
         save_observation_montage(sample, item, output_dir / f"sample_{sample_id:02d}_observations.jpg")
@@ -411,11 +464,15 @@ def main() -> None:
     base_tasks = [str(sample["task"]) for sample in samples]
     mode_tasks = {
         "train_tag": [
-            build_acp_tagged_task(task, is_positive=bool(indicator))
+            (
+                build_acp_tagged_task(task, is_positive=bool(indicator))
+                if indicator or cfg.acp.tag_negative_prompts
+                else task
+            )
             for task, indicator in zip(base_tasks, indicators, strict=True)
         ],
         "positive": [build_acp_tagged_task(task, is_positive=True) for task in base_tasks],
-        "uncond": base_tasks,
+        "base": base_tasks,
     }
 
     generator = torch.Generator(device=args.device)
@@ -435,28 +492,49 @@ def main() -> None:
         for start in range(0, args.num_samples, args.batch_size):
             stop = min(start + args.batch_size, args.num_samples)
             raw_batch = default_collate(samples[start:stop])
-            for mode in ("train_tag", "positive", "uncond"):
+            processed_batches = {}
+            for mode in ("train_tag", "positive", "base"):
                 batch = clone_batch(raw_batch)
                 batch["task"] = mode_tasks[mode][start:stop]
-                processed = preprocessor(batch)
-                torch.cuda.synchronize()
+                processed_batches[mode] = preprocessor(batch)
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize()
                 started = time.perf_counter()
-                normalized = policy.predict_action_chunk(processed, noise=all_noise[start:stop].clone())
+                normalized = policy.predict_action_chunk(
+                    processed_batches[mode], noise=all_noise[start:stop].clone()
+                )
                 prediction = postprocessor(normalized)
-                torch.cuda.synchronize()
+                if args.device.startswith("cuda"):
+                    torch.cuda.synchronize()
                 timings[mode] += time.perf_counter() - started
                 prediction_parts[mode].append(prediction.detach().float().cpu().numpy())
                 print(f"Predicted {mode}: samples {start}:{stop}", flush=True)
 
     predictions = {mode: np.concatenate(parts) for mode, parts in prediction_parts.items()}
-    cfg_mode = f"cfg_beta_{args.cfg_beta}"
-    predictions[cfg_mode] = predictions["uncond"] + args.cfg_beta * (
-        predictions["positive"] - predictions["uncond"]
-    )
-    if cfg_mode != "cfg_beta_0.6":
-        # Plotting uses a stable display key while preserving the requested beta in saved arrays/metrics.
-        predictions["cfg_beta_0.6"] = predictions.pop(cfg_mode)
-        cfg_mode = "cfg_beta_0.6"
+    cfg_mode = f"velocity_cfg_beta_{args.cfg_beta:g}"
+    cfg_parts = []
+    with torch.inference_mode():
+        for start in range(0, args.num_samples, args.batch_size):
+            stop = min(start + args.batch_size, args.num_samples)
+            raw_batch = default_collate(samples[start:stop])
+            base_batch = clone_batch(raw_batch)
+            base_batch["task"] = mode_tasks["base"][start:stop]
+            positive_batch = clone_batch(raw_batch)
+            positive_batch["task"] = mode_tasks["positive"][start:stop]
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            started = time.perf_counter()
+            normalized = policy.predict_action_chunk(
+                preprocessor(base_batch),
+                cfg_positive_batch=preprocessor(positive_batch),
+                cfg_beta=args.cfg_beta,
+                noise=all_noise[start:stop].clone(),
+            )
+            if args.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            timings[cfg_mode] += time.perf_counter() - started
+            cfg_parts.append(postprocessor(normalized).detach().float().cpu().numpy())
+    predictions[cfg_mode] = np.concatenate(cfg_parts)
 
     metrics = compute_metrics(predictions, baseline, truth, valid, indicators, action_names)
     metrics["timings_s"] = dict(timings)
@@ -481,7 +559,11 @@ def main() -> None:
             f"ACP={item['acp_indicator']} | advantage={item['advantage']:.4f}"
         )
         save_action_plot(
-            truth[sample_id], sample_predictions, baseline[sample_id], action_names, title,
+            truth[sample_id],
+            sample_predictions,
+            baseline[sample_id],
+            action_names,
+            title,
             output_dir / f"sample_{sample_id:02d}_actions.png",
         )
 

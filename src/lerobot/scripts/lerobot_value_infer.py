@@ -658,8 +658,10 @@ def run_value_inference_pipeline(
                 indicator_positive_ratio,
             )
 
+            columns[cfg.acp.target_field] = value_targets.astype(np.float32)
             columns[cfg.acp.advantage_field] = advantages.astype(np.float32)
             columns[cfg.acp.indicator_field] = indicators.astype(np.int64)
+            feature_infos[cfg.acp.target_field] = {"dtype": "float32", "shape": (1,), "names": None}
             feature_infos[cfg.acp.advantage_field] = {"dtype": "float32", "shape": (1,), "names": None}
             feature_infos[cfg.acp.indicator_field] = {"dtype": "int64", "shape": (1,), "names": None}
 
@@ -688,6 +690,8 @@ def run_value_inference_pipeline(
             "num_frames": int(frame_count),
             "checkpoint": str(pretrained_dir),
             "value_field": cfg.acp.value_field,
+            "target_field": cfg.acp.target_field if cfg.acp.enable else None,
+            "advantage_field": cfg.acp.advantage_field if cfg.acp.enable else None,
             "acp_enabled": bool(cfg.acp.enable),
             "value_inference_skipped": False,
             "indicator_positive_ratio": indicator_positive_ratio,

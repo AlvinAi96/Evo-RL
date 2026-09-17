@@ -218,6 +218,9 @@ lerobot-value-train="lerobot.scripts.lerobot_value_train:main"
 lerobot-value-infer="lerobot.scripts.lerobot_value_infer:main"
 lerobot-dataset-report="lerobot.scripts.lerobot_dataset_report:main"
 lerobot-export-boundary-frames="lerobot.scripts.lerobot_export_boundary_frames:main"
+lerobot-trim-dataset="lerobot.scripts.lerobot_trim_dataset:main"
+lerobot-vla-analysis="lerobot.scripts.lerobot_vla_analysis:main"
+lerobot-depth-audit="lerobot.scripts.lerobot_depth_audit:main"
 
 # ---------------- Tool Configurations ----------------
 [tool.setuptools.packages.find]

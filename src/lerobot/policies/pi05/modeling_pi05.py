@@ -41,6 +41,7 @@ else:
     PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
+from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pi05.depth_align import (
     PI05_DEPTH_TARGETS_KEY,
     PI05DepthTargetGenerator,
@@ -48,7 +49,6 @@ from lerobot.policies.pi05.depth_align import (
     make_depth_align_head,
     save_depth_alignment_visualization,
 )
-from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
@@ -155,7 +155,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     mode: str = "bilinear",
 ) -> torch.Tensor:
     """PyTorch version of resize_with_pad. Resizes an image to a target height and width without distortion
-    by padding with black. If the image is float32, it must be in the range [-1, 1].
+    by padding with black. Float inputs are expected in [0, 1] and are normalized later.
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
@@ -196,7 +196,7 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     if images.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
     elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(-1.0, 1.0)
+        resized_images = resized_images.clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported image dtype: {images.dtype}")
 
@@ -207,7 +207,8 @@ def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     pad_w1 = pad_w0 + remainder_w
 
     # Pad
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    # This helper runs before [0,1] -> [-1,1] normalization, so black is 0 here.
+    constant_value = 0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),  # left, right, top, bottom
@@ -1381,11 +1382,19 @@ class PI05Policy(PreTrainedPolicy):
         return generator
 
     def _get_depth_targets(self, images: list[Tensor], batch: dict[str, Tensor]) -> Tensor:
-        """优先使用预计算 target；没有时用 MoGe + LingBot-Depth 在线生成。"""
+        """优先使用预计算 target；否则从未做方形 padding 的 RGB 生成 teacher target。"""
         if PI05_DEPTH_TARGETS_KEY in batch:
             return batch[PI05_DEPTH_TARGETS_KEY].to(device=images[0].device)
         generator = self._get_depth_target_generator()
         return generator(images).to(device=images[0].device)
+
+    def _get_depth_teacher_images(self, batch: dict[str, Tensor]) -> list[Tensor]:
+        """Keep each camera's native aspect ratio for MoGe/LingBot-Depth supervision."""
+        present = [batch[key] for key in self.config.image_features if key in batch]
+        missing_count = sum(key not in batch for key in self.config.image_features)
+        if not present:
+            raise ValueError("Depth alignment requires at least one image feature.")
+        return [*present, *[torch.zeros_like(present[-1]) for _ in range(missing_count)]]
 
     def _current_distributed_rank(self) -> int:
         """获取分布式 rank；未初始化分布式时视为主进程。"""
@@ -1435,11 +1444,16 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
+        depth_teacher_images = (
+            self._get_depth_teacher_images(batch) if self.config.depth_align.enable else None
+        )
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
-        depth_targets = self._get_depth_targets(images, batch) if self.config.depth_align.enable else None
+        depth_targets = (
+            self._get_depth_targets(depth_teacher_images, batch) if depth_teacher_images is not None else None
+        )
 
         # Compute loss (no separate state needed for PI05)
         model_output = self.model.forward(

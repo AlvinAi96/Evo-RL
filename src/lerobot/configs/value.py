@@ -68,6 +68,7 @@ class ValueInferenceACPConfig:
 
     intervention_field: str = "complementary_info.is_intervention"
     value_field: str = "complementary_info.value"
+    target_field: str = "complementary_info.value_target"
     advantage_field: str = "complementary_info.advantage"
     indicator_field: str = "complementary_info.acp_indicator"
 
@@ -82,9 +83,10 @@ class ValueInferenceACPConfig:
             raise ValueError("'acp.c_fail_coef' must be non-negative.")
         if not self.value_field:
             raise ValueError("'acp.value_field' must be non-empty.")
-        if self.enable and (not self.advantage_field or not self.indicator_field):
+        if self.enable and (not self.target_field or not self.advantage_field or not self.indicator_field):
             raise ValueError(
-                "'acp.advantage_field' and 'acp.indicator_field' must be non-empty when 'acp.enable=true'."
+                "'acp.target_field', 'acp.advantage_field', and 'acp.indicator_field' "
+                "must be non-empty when 'acp.enable=true'."
             )
 
 

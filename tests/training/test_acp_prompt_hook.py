@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -85,6 +87,35 @@ def test_acp_hook_dropout_keeps_original_task():
 
     out = hook(batch, 0)
     assert out["task"] == ["pick bottle", "place bottle"]
+
+
+def test_acp_hook_episode_success_uses_success_as_positive_and_failure_as_base():
+    dataset = SimpleNamespace(
+        meta=SimpleNamespace(
+            episodes={
+                "episode_index": [0, 1],
+                "episode_success": ["success", "failure"],
+            }
+        )
+    )
+    hook = build_acp_raw_batch_hook(
+        ACPConfig(
+            enable=True,
+            prompt_source="episode_success",
+            indicator_dropout_prob=0.0,
+            failure_loss_mode="keep_loss",
+        ),
+        seed=42,
+        dataset=dataset,
+    )
+    batch = {
+        "task": ["pick bottle", "place bottle"],
+        "episode_index": torch.tensor([0, 1], dtype=torch.int64),
+    }
+
+    out = hook(batch, 0)
+
+    assert out["task"] == [f"pick bottle\n{ACP_POSITIVE_TAG}", "place bottle"]
 
 
 def test_acp_hook_missing_indicator_skips():

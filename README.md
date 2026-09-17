@@ -466,7 +466,7 @@ lerobot-train \
   --acp.indicator_field=complementary_info.acp_indicator_<TAG> \
   --acp.indicator_dropout_prob=0.1 \
   --acp.tag_negative_prompts=false \
-  --acp.failure_loss_mode=mask_loss \
+  --acp.failure_loss_mode=keep_loss \
   --acp.success_field=episode_success \
   --output_dir=outputs/train/<RUN_NAME> \
   --job_name=<RUN_NAME> \
@@ -475,7 +475,7 @@ lerobot-train \
   --policy.repo_id=<HF_USERNAME_OR_ORG>/<POLICY_REPO>
 ```
 
-`--acp.indicator_dropout_prob=0.1` keeps a small portion of positive samples as base prompts. By default, negative samples also use base prompts instead of `Advantage: negative`, which matches the RLinf-style ACP setup. See [`docs/acp_rlinf_alignment.md`](docs/acp_rlinf_alignment.md) for the loss and prompt details.
+`--acp.indicator_dropout_prob=0.1` keeps a small portion of positive samples as base prompts. Negative samples also use base prompts and remain in the policy loss, matching RLinf/RECAP CFG training. See [`docs/acp_rlinf_alignment.md`](docs/acp_rlinf_alignment.md) for the loss and prompt details.
 
 Important checks:
 
